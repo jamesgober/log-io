@@ -1,0 +1,46 @@
+[package]
+name = "log-io"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+readme = "README.md"
+license = "Apache-2.0"
+
+authors = [
+    "James Gober <me@jamesgober.com>"
+]
+
+description = "Structured logging pipeline for Rust. Zero-allocation fast path, JSON / logfmt / human-readable outputs, context propagation (request-id, trace-id), per-module filtering, async-safe sinks. An IO pipeline for log records, not a wrapper around log+tracing."
+
+keywords = [
+    "logging",
+    "structured",
+    "json",
+    "logfmt",
+    "telemetry"
+]
+
+categories = [
+    "development-tools::debugging",
+    "asynchronous"
+]
+
+documentation = "https://docs.rs/log-io"
+repository    = "https://github.com/jamesgober/log-io"
+homepage      = "https://github.com/jamesgober/log-io"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+
+[dev-dependencies]
+
+[features]
+default = ["std"]
+std = []
+
+[profile.release]
+opt-level = 3
+lto = "thin"
