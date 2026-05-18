@@ -4,13 +4,16 @@ Reference documentation for the `log-io` crate.
 
 ## Sections
 
-- [API Reference](./API.md) - the public API surface.
+- [API Reference](./API.md) - the public API surface and how its parts
+  compose into a pipeline.
 
-## Status
+## Authoritative sources
 
-This crate is in early scaffolding. The documentation below describes
-the intended shape; the implementation is not yet complete. See the
-repository's `.dev/ROADMAP.md` for milestone planning.
+The rustdoc on docs.rs is authoritative for signatures. This directory
+holds prose-style references that read better offline.
+
+`.dev/DIRECTIVES.md` is the build-and-policy contract;
+`.dev/ROADMAP.md` is the release schedule.
 
 ## License
 

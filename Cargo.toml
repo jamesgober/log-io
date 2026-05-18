@@ -1,6 +1,6 @@
 [package]
 name = "log-io"
-version = "0.1.0"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.75"
 readme = "README.md"
@@ -22,7 +22,8 @@ keywords = [
 
 categories = [
     "development-tools::debugging",
-    "asynchronous"
+    "asynchronous",
+    "no-std"
 ]
 
 documentation = "https://docs.rs/log-io"
@@ -38,9 +39,47 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dev-dependencies]
 
 [features]
-default = ["std"]
+default = ["std", "json", "logfmt", "human"]
 std = []
+json = []
+logfmt = []
+human = ["std"]
 
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+[[bench]]
+name = "format"
+harness = false
+required-features = ["std", "json", "logfmt", "human"]
+
+[[bench]]
+name = "pipeline"
+harness = false
+required-features = ["std", "json", "logfmt"]
+
+[[example]]
+name = "basic"
+required-features = ["std", "human"]
+
+[[example]]
+name = "json"
+required-features = ["std", "json"]
+
+[[example]]
+name = "context"
+required-features = ["std", "logfmt"]
+
+[[example]]
+name = "filter"
+required-features = ["std", "human"]
+
+[[example]]
+name = "file_sink"
+required-features = ["std", "json"]
+
+[[test]]
+name = "end_to_end"
+required-features = ["std", "json", "logfmt", "human"]
+
