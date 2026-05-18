@@ -12,8 +12,7 @@
 //!
 //! let logger = Logger::builder()
 //!     .level(Level::Info)
-//!     .stdout()
-//!     .json()
+//!     .stdout_json()
 //!     .build();
 //!
 //! logger.log(

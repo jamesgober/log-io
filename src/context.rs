@@ -152,21 +152,26 @@ pub fn with_request_id(id: &str) -> ContextGuard {
 /// slice of [`Field`]. No allocation: the slice is filled from a
 /// stack-resident buffer.
 ///
-/// Within `f`, do not call any other `context::*` mutator on the same
-/// thread (that would re-borrow the thread-local cell and panic).
+/// Reentrancy-safe: if `f` is invoked transitively from inside another
+/// `with_snapshot` call (or while a `with_field` guard is being
+/// constructed), the inner snapshot sees an empty slice rather than
+/// panicking. This makes the context system safe to use inside sinks
+/// that happen to emit log records of their own.
 pub fn with_snapshot<R>(f: impl FnOnce(&[Field<'_>]) -> R) -> R {
-    CONTEXT.with(|cell| {
-        let ctx = cell.borrow();
-        const EMPTY: Field<'static> = Field {
-            key: "",
-            value: Value::Null,
-        };
-        let mut buf: [Field<'_>; MAX_CONTEXT_SLOTS] = [EMPTY; MAX_CONTEXT_SLOTS];
-        let len = ctx.slots.len().min(MAX_CONTEXT_SLOTS);
-        for (i, slot) in ctx.slots.iter().take(len).enumerate() {
-            buf[i] = Field::new(slot.key.as_str(), slot.value.as_value());
+    CONTEXT.with(|cell| match cell.try_borrow() {
+        Ok(ctx) => {
+            const EMPTY: Field<'static> = Field {
+                key: "",
+                value: Value::Null,
+            };
+            let mut buf: [Field<'_>; MAX_CONTEXT_SLOTS] = [EMPTY; MAX_CONTEXT_SLOTS];
+            let len = ctx.slots.len().min(MAX_CONTEXT_SLOTS);
+            for (i, slot) in ctx.slots.iter().take(len).enumerate() {
+                buf[i] = Field::new(slot.key.as_str(), slot.value.as_value());
+            }
+            f(&buf[..len])
         }
-        f(&buf[..len])
+        Err(_) => f(&[]),
     })
 }
 

@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c3ea200ad192263efdba6033a2e526d9aa04c1a85bb041d454445050714cf0b4 # shrinks to (level, target, message, fields) = (Trace, "", "", [OwnedField { key: "\n", value: Null }])
+cc 8eb9cf329232fe16e8d117e5e8195e00c3ffcf4aa6fcaf871898b246c7475a34 # shrinks to default = Trace, overrides = [("___", Info), ("___", Trace)]

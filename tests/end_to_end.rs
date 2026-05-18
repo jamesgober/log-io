@@ -1,13 +1,12 @@
 //! End-to-end tests covering the full record pipeline.
 //!
-//! These are intentionally light on internal mocking: each test stands
-//! up a real `Logger` writing to a `Vec<u8>` capture and inspects the
-//! resulting bytes.
+//! Each test stands up a real `Logger` writing to a `Vec<u8>` capture
+//! and inspects the resulting bytes.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use log_io::format::{HumanFormat, JsonFormat};
+use log_io::format::{HumanFormat, JsonFormat, LogfmtFormat};
 use log_io::sink::{NullSink, WriterSink};
 use log_io::{context, Field, Filter, Level, Logger, Value};
 
@@ -35,8 +34,7 @@ fn json_logger(buf: Capture) -> Logger {
         .level(Level::Trace)
         .no_timestamps()
         .no_context()
-        .writer(move || buf)
-        .json()
+        .writer(buf, JsonFormat::new())
         .build()
 }
 
@@ -60,21 +58,7 @@ fn logfmt_pipeline_emits_key_value_pairs() {
         .level(Level::Trace)
         .no_timestamps()
         .no_context()
-        .writer(move || buf.clone())
-        .logfmt()
-        .build();
-    drop(logger);
-
-    let buf2 = Capture::default();
-    let logger = Logger::builder()
-        .level(Level::Trace)
-        .no_timestamps()
-        .no_context()
-        .writer({
-            let buf2 = buf2.clone();
-            move || buf2
-        })
-        .logfmt()
+        .writer(buf.clone(), LogfmtFormat::new())
         .build();
 
     logger.log(
@@ -82,7 +66,7 @@ fn logfmt_pipeline_emits_key_value_pairs() {
         "ok",
         &[Field::new("k", 1_u64), Field::new("name", "alice")],
     );
-    let out = buf2.dump();
+    let out = buf.dump();
     assert!(out.contains("level=info"));
     assert!(out.contains("message=ok"));
     assert!(out.contains("k=1"));
@@ -96,11 +80,7 @@ fn human_pipeline_emits_aligned_line() {
         .level(Level::Trace)
         .no_timestamps()
         .no_context()
-        .writer({
-            let buf = buf.clone();
-            move || buf
-        })
-        .human()
+        .writer(buf.clone(), HumanFormat::new())
         .build();
     logger.log(Level::Warn, "hi", &[]);
     let out = buf.dump();
@@ -109,27 +89,21 @@ fn human_pipeline_emits_aligned_line() {
 }
 
 #[test]
-fn filter_directive_via_builder_blocks_below_threshold() {
+fn filter_directive_blocks_below_threshold() {
     let buf = Capture::default();
     let logger = Logger::builder()
         .filter_directive("warn, app::auth=trace")
         .no_timestamps()
         .no_context()
-        .writer({
-            let buf = buf.clone();
-            move || buf
-        })
-        .logfmt()
+        .writer(buf.clone(), LogfmtFormat::new())
         .build();
 
+    logger.try_log(Level::Info, "app", "info-app", &[]).unwrap();
     logger
-        .try_log_with_target(Level::Info, "app", "info-app", &[])
+        .try_log(Level::Trace, "app::auth", "trace-auth", &[])
         .unwrap();
     logger
-        .try_log_with_target(Level::Trace, "app::auth", "trace-auth", &[])
-        .unwrap();
-    logger
-        .try_log_with_target(Level::Error, "other", "error-other", &[])
+        .try_log(Level::Error, "other", "error-other", &[])
         .unwrap();
     let out = buf.dump();
     assert!(!out.contains("info-app"), "{out}");
@@ -140,17 +114,10 @@ fn filter_directive_via_builder_blocks_below_threshold() {
 #[test]
 fn context_propagates_to_record() {
     let buf = Capture::default();
-    let logger = json_logger(Capture::default());
-    drop(logger);
-
     let logger = Logger::builder()
         .level(Level::Trace)
         .no_timestamps()
-        .writer({
-            let buf = buf.clone();
-            move || buf
-        })
-        .json()
+        .writer(buf.clone(), JsonFormat::new())
         .build();
 
     context::clear();
@@ -172,28 +139,23 @@ fn null_sink_is_silent() {
         .level(Level::Trace)
         .no_timestamps()
         .no_context()
-        .add_sink(NullSink::new())
-        .null()
-        .json()
+        .with_sink(NullSink::new())
         .build();
     logger.log(Level::Error, "dropped", &[]);
 }
 
 #[test]
-fn add_sink_works_with_custom_format_choice() {
+fn with_sink_accepts_arbitrary_sink() {
     let buf = Capture::default();
     let sink = WriterSink::new(buf.clone(), JsonFormat::new());
     let logger = Logger::builder()
         .level(Level::Trace)
         .no_timestamps()
         .no_context()
-        .add_sink(sink)
-        .null()
-        .json()
+        .with_sink(sink)
         .build();
     logger.log(Level::Info, "ok", &[]);
-    let out = buf.dump();
-    assert!(out.contains("\"message\":\"ok\""), "{out}");
+    assert!(buf.dump().contains("\"message\":\"ok\""));
 }
 
 #[test]
@@ -203,38 +165,11 @@ fn pretty_json_writes_multiple_lines_per_record() {
         .level(Level::Trace)
         .no_timestamps()
         .no_context()
-        .writer({
-            let buf = buf.clone();
-            move || buf
-        })
-        .json_with(JsonFormat::new().pretty(true))
+        .writer(buf.clone(), JsonFormat::new().pretty(true))
         .build();
     logger.log(Level::Info, "x", &[Field::new("y", 1_u32)]);
     let out = buf.dump();
     assert!(out.contains("\n  \"level\""), "{out}");
-}
-
-#[test]
-fn human_with_options_can_show_source_location() {
-    let buf = Capture::default();
-    let logger = Logger::builder()
-        .level(Level::Trace)
-        .no_timestamps()
-        .no_context()
-        .writer({
-            let buf = buf.clone();
-            move || buf
-        })
-        .human_with(HumanFormat::new().show_source_location(true))
-        .build();
-    logger
-        .try_log_with_target(Level::Info, "tgt", "hi", &[])
-        .unwrap();
-    let out = buf.dump();
-    // Source location is not auto-captured by the logger today, so the
-    // line should NOT contain the file path here. This pins the
-    // behavior: callers must use the lower-level API to attach source.
-    assert!(!out.contains("file.rs"));
 }
 
 #[test]
@@ -244,15 +179,11 @@ fn macros_compile_and_emit() {
         .level(Level::Trace)
         .no_timestamps()
         .no_context()
-        .writer({
-            let buf = buf.clone();
-            move || buf
-        })
-        .logfmt()
+        .writer(buf.clone(), LogfmtFormat::new())
         .build();
 
     log_io::info!(logger, "hello");
-    log_io::warn_!(logger, "watch out", port = 80_u32);
+    log_io::warn!(logger, "watch out", port = 80_u32);
     log_io::error!(logger, "bad", code = 500_u32, retry = true);
     log_io::debug!(logger, "deep");
     log_io::trace!(logger, "deeper");
@@ -265,6 +196,20 @@ fn macros_compile_and_emit() {
 }
 
 #[test]
+fn macros_capture_source_location() {
+    let buf = Capture::default();
+    let logger = Logger::builder()
+        .level(Level::Trace)
+        .no_timestamps()
+        .no_context()
+        .writer(buf.clone(), HumanFormat::new().show_source_location(true))
+        .build();
+    log_io::info!(logger, "loc");
+    let out = buf.dump();
+    assert!(out.contains("end_to_end.rs"), "{out}");
+}
+
+#[test]
 fn filter_min_level_reflects_lowest_rule() {
     let logger = Logger::builder()
         .filter(
@@ -274,8 +219,7 @@ fn filter_min_level_reflects_lowest_rule() {
         )
         .no_timestamps()
         .no_context()
-        .null()
-        .json()
+        .with_sink(NullSink::new())
         .build();
     assert_eq!(logger.min_level(), Level::Trace);
 }
@@ -286,10 +230,8 @@ fn flush_propagates_to_all_sinks() {
         .level(Level::Trace)
         .no_timestamps()
         .no_context()
-        .add_sink(NullSink::new())
-        .add_sink(NullSink::new())
-        .null()
-        .json()
+        .with_sink(NullSink::new())
+        .with_sink(NullSink::new())
         .build();
     logger.flush().unwrap();
 }
@@ -314,8 +256,7 @@ fn concurrent_writers_dont_interleave_records() {
     use std::thread;
 
     let buf = Capture::default();
-    let logger = json_logger(buf.clone());
-    let logger = Arc::new(logger);
+    let logger = Arc::new(json_logger(buf.clone()));
 
     let mut handles = Vec::new();
     for t in 0..8 {
@@ -334,11 +275,103 @@ fn concurrent_writers_dont_interleave_records() {
         h.join().unwrap();
     }
     let out = buf.dump();
-    // Every line should be a complete JSON record terminated by \n.
     let mut lines = 0usize;
     for line in out.lines() {
         assert!(line.starts_with('{') && line.ends_with('}'), "{line}");
         lines += 1;
     }
     assert_eq!(lines, 8 * 100);
+}
+
+#[test]
+fn default_fields_appear_on_every_record() {
+    let buf = Capture::default();
+    let logger = Logger::builder()
+        .level(Level::Trace)
+        .no_timestamps()
+        .no_context()
+        .with_default_field("service", "api")
+        .with_default_field("version", "1.2.3")
+        .writer(buf.clone(), JsonFormat::new())
+        .build();
+    logger.log(Level::Info, "a", &[]);
+    logger.log(Level::Warn, "b", &[Field::new("port", 80_u32)]);
+
+    let out = buf.dump();
+    assert_eq!(out.matches("\"service\":\"api\"").count(), 2);
+    assert_eq!(out.matches("\"version\":\"1.2.3\"").count(), 2);
+    assert!(out.contains("\"port\":80"));
+}
+
+#[test]
+fn multi_sink_fanout_delivers_to_all() {
+    let buf_a = Capture::default();
+    let buf_b = Capture::default();
+    let logger = Logger::builder()
+        .level(Level::Trace)
+        .no_timestamps()
+        .no_context()
+        .writer(buf_a.clone(), JsonFormat::new())
+        .writer(buf_b.clone(), LogfmtFormat::new())
+        .build();
+
+    logger.log(Level::Info, "fanout", &[Field::new("k", 1_u32)]);
+
+    assert!(buf_a.dump().contains("\"message\":\"fanout\""));
+    assert!(buf_b.dump().contains("message=fanout"));
+}
+
+#[test]
+fn on_error_handler_receives_sink_errors() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Bad;
+    impl log_io::Sink for Bad {
+        fn write_record(&self, _r: &log_io::Record<'_>) -> log_io::Result<()> {
+            Err(log_io::Error::Configuration("synthetic"))
+        }
+        fn flush(&self) -> log_io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let count_clone = count.clone();
+    let logger = Logger::builder()
+        .level(Level::Trace)
+        .no_timestamps()
+        .no_context()
+        .with_sink(Bad)
+        .on_error(Arc::new(move |_e| {
+            count_clone.fetch_add(1, Ordering::Relaxed);
+        }))
+        .build();
+    let _ = logger.try_log(Level::Info, "t", "m", &[]);
+    let _ = logger.try_log(Level::Info, "t", "m", &[]);
+    assert_eq!(count.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn dispatch_continues_when_one_sink_fails() {
+    struct Bad;
+    impl log_io::Sink for Bad {
+        fn write_record(&self, _r: &log_io::Record<'_>) -> log_io::Result<()> {
+            Err(log_io::Error::Configuration("synthetic"))
+        }
+        fn flush(&self) -> log_io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let buf = Capture::default();
+    let logger = Logger::builder()
+        .level(Level::Trace)
+        .no_timestamps()
+        .no_context()
+        .with_sink(Bad)
+        .writer(buf.clone(), JsonFormat::new())
+        .build();
+    let result = logger.try_log(Level::Info, "t", "m", &[]);
+    assert!(result.is_err()); // first sink error is surfaced ...
+    assert!(buf.dump().contains("\"message\":\"m\"")); // ... but the second sink still got the record
 }

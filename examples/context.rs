@@ -7,11 +7,7 @@
 use log_io::{context, Field, Level, Logger};
 
 fn main() {
-    let logger = Logger::builder()
-        .level(Level::Info)
-        .stdout()
-        .logfmt()
-        .build();
+    let logger = Logger::builder().level(Level::Info).stdout_logfmt().build();
 
     handle_request(&logger, "tx-7f3a", "req-001");
     handle_request(&logger, "tx-9c4b", "req-002");

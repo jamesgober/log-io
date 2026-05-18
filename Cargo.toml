@@ -1,6 +1,6 @@
 [package]
 name = "log-io"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.75"
 readme = "README.md"
@@ -37,13 +37,17 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 
 [dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[workspace]
+exclude = ["fuzz"]
 
 [features]
 default = ["std", "json", "logfmt", "human"]
 std = []
 json = []
 logfmt = []
-human = ["std"]
+human = []
 
 [profile.release]
 opt-level = 3
@@ -58,6 +62,11 @@ required-features = ["std", "json", "logfmt", "human"]
 name = "pipeline"
 harness = false
 required-features = ["std", "json", "logfmt"]
+
+[[bench]]
+name = "concurrent"
+harness = false
+required-features = ["std", "json"]
 
 [[example]]
 name = "basic"
@@ -79,7 +88,31 @@ required-features = ["std", "human"]
 name = "file_sink"
 required-features = ["std", "json"]
 
+[[example]]
+name = "multi_sink"
+required-features = ["std", "json", "human"]
+
+[[example]]
+name = "custom_format"
+required-features = ["std"]
+
+[[example]]
+name = "custom_sink"
+required-features = ["std", "json"]
+
+[[example]]
+name = "default_fields"
+required-features = ["std", "json"]
+
 [[test]]
 name = "end_to_end"
+required-features = ["std", "json", "logfmt", "human"]
+
+[[test]]
+name = "stress"
+required-features = ["std", "json", "logfmt", "human"]
+
+[[test]]
+name = "property"
 required-features = ["std", "json", "logfmt", "human"]
 

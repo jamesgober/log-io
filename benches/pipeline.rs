@@ -1,23 +1,23 @@
 //! End-to-end pipeline benchmark: Logger -> Filter -> Format -> Sink.
 //!
-//! Two paths are measured:
+//! Three paths are measured:
 //!
-//! 1. `*_null`: the sink discards records before formatting, so this is
-//!    the cost of filter + context snapshot + dispatch.
-//! 2. `*_writer`: a custom sink wraps a discarding writer so the
-//!    format step actually runs.
+//! 1. `dispatch_only` - sink discards the record before formatting.
+//!    Measures filter + context snapshot + dispatch overhead.
+//! 2. `below_threshold` - record filtered out. Measures the gate.
+//! 3. `* + writer` - the full pipeline, format included, writing to
+//!    a non-allocating discarding `Write`.
 
 use std::hint::black_box;
 use std::io::{self, Write};
 use std::time::Instant;
 
-use log_io::format::JsonFormat;
-use log_io::sink::WriterSink;
+use log_io::format::{JsonFormat, LogfmtFormat};
+use log_io::sink::NullSink;
 use log_io::{Field, Level, Logger, Value};
 
 const ITERS: u32 = 200_000;
 
-/// Writer that drops everything but exercises the formatter path.
 struct DevNull;
 
 impl Write for DevNull {
@@ -39,7 +39,7 @@ fn time<F: FnMut()>(name: &str, mut f: F) {
     }
     let elapsed = start.elapsed();
     let per = elapsed.as_nanos() / u128::from(ITERS);
-    println!("{name:>30}: {per:>5} ns/call");
+    println!("{name:>34}: {per:>5} ns/call");
 }
 
 fn main() {
@@ -47,37 +47,43 @@ fn main() {
         .level(Level::Trace)
         .no_timestamps()
         .no_context()
-        .null()
-        .json()
+        .with_sink(NullSink::new())
         .build();
 
     let logger_filtered = Logger::builder()
         .level(Level::Error)
         .no_timestamps()
         .no_context()
-        .null()
-        .json()
+        .with_sink(NullSink::new())
         .build();
 
     let logger_json_writer = Logger::builder()
         .level(Level::Trace)
         .no_timestamps()
         .no_context()
-        .add_sink(WriterSink::new(DevNull, JsonFormat::new()))
-        .null()
-        .json()
+        .writer(DevNull, JsonFormat::new())
         .build();
 
     let logger_logfmt_writer = Logger::builder()
         .level(Level::Trace)
         .no_timestamps()
         .no_context()
-        .add_sink(WriterSink::new(
-            DevNull,
-            log_io::format::LogfmtFormat::new(),
-        ))
-        .null()
-        .json()
+        .writer(DevNull, LogfmtFormat::new())
+        .build();
+
+    let logger_default_fields = Logger::builder()
+        .level(Level::Trace)
+        .no_timestamps()
+        .no_context()
+        .with_default_field("service", "api")
+        .with_default_field("version", "1.2.3")
+        .writer(DevNull, JsonFormat::new())
+        .build();
+
+    let logger_with_ctx_capture = Logger::builder()
+        .level(Level::Trace)
+        .no_timestamps()
+        .writer(DevNull, JsonFormat::new())
         .build();
 
     let fields = [
@@ -100,5 +106,11 @@ fn main() {
     });
     time("json + writer (no fields)", || {
         logger_json_writer.log(Level::Info, black_box("hello"), &[]);
+    });
+    time("with 2 default fields", || {
+        logger_default_fields.log(Level::Info, black_box("hello"), &fields);
+    });
+    time("with empty context snapshot", || {
+        logger_with_ctx_capture.log(Level::Info, black_box("hello"), &fields);
     });
 }

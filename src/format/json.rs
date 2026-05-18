@@ -154,20 +154,46 @@ fn comma<W: fmt::Write + ?Sized>(w: &mut W, first: &mut bool, nl: &str, ind: &st
 
 fn write_json_str<W: fmt::Write + ?Sized>(w: &mut W, s: &str) -> fmt::Result {
     w.write_char('"')?;
-    for c in s.chars() {
-        match c {
-            '"' => w.write_str("\\\"")?,
-            '\\' => w.write_str("\\\\")?,
-            '\n' => w.write_str("\\n")?,
-            '\r' => w.write_str("\\r")?,
-            '\t' => w.write_str("\\t")?,
-            '\x08' => w.write_str("\\b")?,
-            '\x0c' => w.write_str("\\f")?,
-            c if (c as u32) < 0x20 => {
-                write!(w, "\\u{:04x}", c as u32)?;
+    // Batched escape: scan the string for the next byte that needs
+    // escaping, write the clean run as one chunk, then emit the
+    // escape, then repeat. UTF-8 is preserved because the bytes that
+    // need escaping (ASCII control + " + \) are all single-byte.
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let escape: Option<&'static str> = match b {
+            b'"' => Some("\\\""),
+            b'\\' => Some("\\\\"),
+            b'\n' => Some("\\n"),
+            b'\r' => Some("\\r"),
+            b'\t' => Some("\\t"),
+            0x08 => Some("\\b"),
+            0x0c => Some("\\f"),
+            0x00..=0x1F => None, // generic \u00XX path below
+            _ => {
+                i += 1;
+                continue;
             }
-            c => w.write_char(c)?,
+        };
+        if start < i {
+            // SAFETY-equivalent: the clean run is valid UTF-8 because
+            // we only skipped past non-escape bytes; all such bytes
+            // are either ASCII (single byte) or UTF-8 continuation /
+            // leading bytes that we copied as a contiguous slice.
+            w.write_str(&s[start..i])?;
         }
+        if let Some(seq) = escape {
+            w.write_str(seq)?;
+        } else {
+            write!(w, "\\u{:04x}", b)?;
+        }
+        i += 1;
+        start = i;
+    }
+    if start < bytes.len() {
+        w.write_str(&s[start..])?;
     }
     w.write_char('"')
 }

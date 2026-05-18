@@ -21,26 +21,29 @@
 
 ## Status
 
-`0.9.x` is the pre-1.0 stabilization line. The public API is feature-
-complete and tested; `1.0.0` will follow a soak period.
+`0.10.x` is the pre-1.0 stabilization line. The public API is feature-
+complete, property-tested, fuzzed, and stress-tested; `1.0.0` will
+follow a soak period.
 
 ## What it does
 
-Structured logging pipeline for Rust. Zero-allocation fast path, JSON / logfmt / human-readable outputs, context propagation (request-id, trace-id), per-module filtering, async-safe sinks. An IO pipeline for log records, not a wrapper around log+tracing.
+Structured logging pipeline for Rust. Zero-allocation steady-state hot
+path, JSON / logfmt / human-readable outputs, context propagation
+(request-id, trace-id), per-module filtering, async-safe sinks. An IO
+pipeline for log records, not a wrapper around log+tracing.
 
 ## Quick start
 
 ```rust
-use log_io::{Field, Level, Logger};
+use log_io::{Level, Logger};
 
 let logger = Logger::builder()
     .level(Level::Info)
-    .stdout()
-    .json()
+    .stdout_json()
     .build();
 
 log_io::info!(logger, "server started", port = 8080_u32);
-log_io::warn_!(logger, "slow request", path = "/api/users", ms = 412_u64);
+log_io::warn!(logger, "slow request", path = "/api/users", ms = 412_u64);
 ```
 
 ## Features
@@ -51,11 +54,20 @@ log_io::warn_!(logger, "slow request", path = "/api/users", ms = 412_u64);
   directives, prefix-matched on `::` and `.` boundaries.
 - **Thread-local context**: stash `trace_id` / `request_id` once at
   the request boundary; every downstream record carries them.
+- **Per-logger default fields**: attach service / version / region
+  once at builder time; every record carries them.
+- **Multi-sink fan-out**: human format on stderr for developer eyes
+  and JSON to a file for ingest, served from one logger.
+- **Source location capture**: macros attach `file!()`, `line!()`,
+  and `module_path!()` to every record.
 - **Zero runtime dependencies**: depends only on `core` and `std`.
 - **`no_std`-compatible data model**: the `Record` / `Format` layer
-  compiles without `std` and can be wired to embedded `core::fmt::Write`
-  destinations.
+  (including JSON, logfmt, and human) compiles without `std` and can
+  be wired to embedded `core::fmt::Write` destinations.
 - **`#![forbid(unsafe_code)]`** crate-wide.
+- **Property-tested and fuzzed**: formatter invariants checked via
+  `proptest`; `cargo-fuzz` targets for the filter parser and
+  formatter escapers.
 
 ## Status
 

@@ -84,13 +84,13 @@ impl Format for HumanFormat {
         write!(writer, "{:<5} ", record.metadata.level.as_str_upper())?;
         if self.show_target {
             writer.write_char('[')?;
-            writer.write_str(record.metadata.target)?;
+            write_line_safe(writer, record.metadata.target)?;
             writer.write_str("] ")?;
         }
-        writer.write_str(record.message)?;
+        write_line_safe(writer, record.message)?;
         for field in record.all_fields() {
             writer.write_char(' ')?;
-            writer.write_str(field.key)?;
+            write_line_safe(writer, field.key)?;
             writer.write_char('=')?;
             write_value(writer, field.value)?;
         }
@@ -103,6 +103,21 @@ impl Format for HumanFormat {
     }
 }
 
+/// Write `s` without ever emitting a literal newline, tab, or CR.
+/// These are escaped with `\n` / `\t` / `\r` so the human format
+/// remains one record per line.
+fn write_line_safe<W: fmt::Write + ?Sized>(w: &mut W, s: &str) -> fmt::Result {
+    for c in s.chars() {
+        match c {
+            '\n' => w.write_str("\\n")?,
+            '\r' => w.write_str("\\r")?,
+            '\t' => w.write_str("\\t")?,
+            c => w.write_char(c)?,
+        }
+    }
+    Ok(())
+}
+
 fn write_value<W: fmt::Write + ?Sized>(w: &mut W, v: Value<'_>) -> fmt::Result {
     match v {
         Value::Null => w.write_str("<null>"),
@@ -111,13 +126,20 @@ fn write_value<W: fmt::Write + ?Sized>(w: &mut W, v: Value<'_>) -> fmt::Result {
         Value::U64(n) => write!(w, "{n}"),
         Value::F64(n) => write!(w, "{n}"),
         Value::Str(s) => {
-            if s.chars().any(|c| c.is_whitespace() || c == '"') {
+            let needs_quote = s
+                .chars()
+                .any(|c| c.is_whitespace() || c == '"' || (c as u32) < 0x20);
+            if needs_quote {
                 w.write_char('"')?;
                 for c in s.chars() {
-                    if c == '"' {
-                        w.write_str("\\\"")?;
-                    } else {
-                        w.write_char(c)?;
+                    match c {
+                        '"' => w.write_str("\\\"")?,
+                        '\\' => w.write_str("\\\\")?,
+                        '\n' => w.write_str("\\n")?,
+                        '\r' => w.write_str("\\r")?,
+                        '\t' => w.write_str("\\t")?,
+                        c if (c as u32) < 0x20 => write!(w, "\\x{:02x}", c as u32)?,
+                        c => w.write_char(c)?,
                     }
                 }
                 w.write_char('"')
