@@ -1,0 +1,40 @@
+[package]
+name = "log-io-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+rust-version = "1.75"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+log-io = { path = ".." }
+
+[[bin]]
+name = "filter_directive"
+path = "fuzz_targets/filter_directive.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "json_escape"
+path = "fuzz_targets/json_escape.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "logfmt_format"
+path = "fuzz_targets/logfmt_format.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "level_parse"
+path = "fuzz_targets/level_parse.rs"
+test = false
+doc = false
+
+[workspace]
+members = ["."]

@@ -3,11 +3,7 @@
 use log_io::{Field, Level, Logger, Value};
 
 fn main() {
-    let logger = Logger::builder()
-        .level(Level::Info)
-        .stdout()
-        .human()
-        .build();
+    let logger = Logger::builder().level(Level::Info).stdout_human().build();
 
     logger.log(
         Level::Info,

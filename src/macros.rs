@@ -4,17 +4,20 @@
 //! call. Fields use a `key = expr` syntax; the expression must produce
 //! a value convertible to [`crate::Value`].
 //!
+//! All macros capture the caller's source location ([`file!`],
+//! [`line!`]) and module path ([`module_path!`]) and attach them to
+//! the record's [`crate::Metadata`].
+//!
 //! # Example
 //!
 //! ```
-//! use log_io::{Field, Level, Logger};
+//! use log_io::{Level, Logger};
 //!
 //! let logger = Logger::builder()
 //!     .level(Level::Info)
 //!     .no_timestamps()
 //!     .no_context()
-//!     .null()
-//!     .json()
+//!     .with_sink(log_io::sink::NullSink::new())
 //!     .build();
 //!
 //! log_io::info!(logger, "request handled", port = 8080_u32, ok = true);
@@ -23,36 +26,32 @@
 /// Emit a log record at the given level.
 ///
 /// The first argument is a `Logger` (by reference or by value). The
-/// second is the message string. Any number of `key = expr` pairs may
-/// follow.
+/// second is the level. The third is the message string. Any number
+/// of `key = expr` pairs may follow.
 #[macro_export]
 macro_rules! log_at {
     ($logger:expr, $level:expr, $msg:expr $(,)?) => {{
         let __logger = &$logger;
-        if __logger.enabled(module_path!(), $level) {
+        let __level: $crate::Level = $level;
+        if __logger.enabled(::core::module_path!(), __level) {
             let __fields: [$crate::Field<'_>; 0] = [];
-            let _ = __logger.try_log_with_target(
-                $level,
-                module_path!(),
-                $msg,
-                &__fields,
-            );
+            let __metadata = $crate::Metadata::new(__level, ::core::module_path!())
+                .with_location(::core::file!(), ::core::line!());
+            let _ = __logger.try_emit(__metadata, $msg, &__fields);
         }
     }};
     ($logger:expr, $level:expr, $msg:expr, $($key:ident = $value:expr),+ $(,)?) => {{
         let __logger = &$logger;
-        if __logger.enabled(module_path!(), $level) {
+        let __level: $crate::Level = $level;
+        if __logger.enabled(::core::module_path!(), __level) {
             let __fields = [
                 $(
                     $crate::Field::new(stringify!($key), $crate::Value::from($value)),
                 )+
             ];
-            let _ = __logger.try_log_with_target(
-                $level,
-                module_path!(),
-                $msg,
-                &__fields,
-            );
+            let __metadata = $crate::Metadata::new(__level, ::core::module_path!())
+                .with_location(::core::file!(), ::core::line!());
+            let _ = __logger.try_emit(__metadata, $msg, &__fields);
         }
     }};
 }
@@ -82,17 +81,12 @@ macro_rules! info {
 }
 
 /// Emit a [`crate::Level::Warn`] record.
+///
+/// Despite the name colliding with the `warn` attribute, this macro
+/// works in expression position the same way `log::warn!` does in the
+/// upstream `log` crate.
 #[macro_export]
-macro_rules! warn_ {
-    ($logger:expr, $($rest:tt)*) => {
-        $crate::log_at!($logger, $crate::Level::Warn, $($rest)*)
-    };
-}
-
-// Workaround: `warn` collides with the attribute, so export both.
-#[macro_export]
-#[doc(hidden)]
-macro_rules! __log_io_warn {
+macro_rules! warn {
     ($logger:expr, $($rest:tt)*) => {
         $crate::log_at!($logger, $crate::Level::Warn, $($rest)*)
     };
