@@ -78,3 +78,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.75
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all-features --verbose
+
+  semver-checks:
+    name: SemVer checks
+    runs-on: ubuntu-latest
+    # Only run against the published baseline; on pre-1.0.0 commits
+    # there is nothing to compare against and the job is skipped.
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          feature-group: all-features

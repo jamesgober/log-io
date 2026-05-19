@@ -240,7 +240,19 @@ writer; scales to ~28 M at four threads before mutex contention.
 
 ## 8. Stability guarantees
 
-`0.x.y` releases are not API-stable. Stability begins at `1.0.0`.
+The crate is at `1.0.0`. The public API surface listed in section 4
+is stable: subsequent `1.x.y` releases preserve backwards
+compatibility. Backwards-incompatible changes require a major
+version bump and a CHANGELOG entry under `### Changed` flagged
+**Breaking**.
+
+The following are NOT covered by the stability guarantee:
+
+- Performance numbers in section 7. They are indicative; small
+  regressions or improvements are not breaking.
+- Crate-internal items (anything `pub(crate)` or unexported).
+- Banned-word policy and other developer-facing items in
+  `.dev/DIRECTIVES.md`.
 
 ## 9. Dependency policy
 
