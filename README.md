@@ -11,6 +11,7 @@
     <a href="https://crates.io/crates/log-io"><img alt="downloads" src="https://img.shields.io/crates/d/log-io.svg"></a>
     <a href="https://docs.rs/log-io"><img alt="docs.rs" src="https://docs.rs/log-io/badge.svg"></a>
     <a href="https://github.com/jamesgober/log-io/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/jamesgober/log-io/actions/workflows/ci.yml/badge.svg"></a>
+    <a href="https://github.com/rust-lang/rfcs/blob/master/text/2495-min-rust-version.md" title="MSRV"><img alt="MSRV" src="https://img.shields.io/badge/MSRV-1.75%2B-blue"></a>
 </p>
 
 <p align="center">
