@@ -30,19 +30,22 @@
 //!   [`core::fmt::Write`]-based formatters available.
 //! * `json` (default): JSON output format.
 //! * `logfmt` (default): `key=value` logfmt output format.
-//! * `human` (default, requires `std`): human-readable timestamped
-//!   format. Requires `std` because timestamps depend on `SystemTime`.
+//! * `human` (default): human-readable format with aligned columns
+//!   and RFC 3339 timestamps. `no_std`-compatible.
 //!
 //! # Design notes
 //!
-//! The fast path is zero-allocation. [`Record`], [`Field`], and
-//! [`Value`] all borrow their data. Formatters serialize directly into
-//! a writer; no intermediate `String` is produced unless the caller
-//! supplies one.
+//! The fast path is allocation-free in steady state. [`Record`],
+//! [`Field`], and [`Value`] all borrow their data. Formatters
+//! serialize directly into a writer; the built-in sinks use a
+//! thread-local scratch buffer so per-record formatting does not
+//! touch the allocator after the first call.
 //!
 //! # Stability
 //!
-//! `0.x.y` releases are not API-stable. Stability begins at `1.0.0`.
+//! `1.x.y` releases preserve backwards compatibility. The full public
+//! API surface is documented in `REPS.md` section 4 and exhaustively
+//! in `docs/API.md`.
 
 #![doc(html_root_url = "https://docs.rs/log-io")]
 #![cfg_attr(docsrs, feature(doc_cfg))]

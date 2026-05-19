@@ -19,18 +19,20 @@
 
 ---
 
-## Status
+## Overview
 
-`0.10.x` is the pre-1.0 stabilization line. The public API is feature-
-complete, property-tested, fuzzed, and stress-tested; `1.0.0` will
-follow a soak period.
+`log-io` is a structured logging pipeline for Rust. It is not a wrapper
+around `log` or `tracing`. A record flows through three composable
+stages: filter, format, sink. The fast path is allocation-free; the
+data model is `no_std`-compatible; the crate has zero runtime
+dependencies.
 
-## What it does
+## Install
 
-Structured logging pipeline for Rust. Zero-allocation steady-state hot
-path, JSON / logfmt / human-readable outputs, context propagation
-(request-id, trace-id), per-module filtering, async-safe sinks. An IO
-pipeline for log records, not a wrapper around log+tracing.
+```toml
+[dependencies]
+log-io = "1"
+```
 
 ## Quick start
 
@@ -62,18 +64,48 @@ log_io::warn!(logger, "slow request", path = "/api/users", ms = 412_u64);
   and `module_path!()` to every record.
 - **Zero runtime dependencies**: depends only on `core` and `std`.
 - **`no_std`-compatible data model**: the `Record` / `Format` layer
-  (including JSON, logfmt, and human) compiles without `std` and can
-  be wired to embedded `core::fmt::Write` destinations.
+  compiles without `std` and can be wired to embedded
+  `core::fmt::Write` destinations.
 - **`#![forbid(unsafe_code)]`** crate-wide.
-- **Property-tested and fuzzed**: formatter invariants checked via
-  `proptest`; `cargo-fuzz` targets for the filter parser and
-  formatter escapers.
 
-## Status
+## Performance
 
-See [`.dev/ROADMAP.md`](.dev/ROADMAP.md) for the path to 1.0.
-[`docs/API.md`](docs/API.md) is the prose API reference;
-[`REPS.md`](REPS.md) is the formal specification.
+| Workload                            | ns / record |
+|-------------------------------------|------------:|
+| JSON, 5 fields, formatter only      | ~131        |
+| logfmt, 5 fields, formatter only    | ~159        |
+| human, 5 fields, formatter only     | ~210        |
+| Pipeline, 3 fields, JSON + writer   | ~59         |
+| Pipeline, filtered out below thresh | ~1          |
+
+Single-thread throughput is ~15 M records/sec to a discarding writer;
+scales to ~28 M at four threads. See [`BENCH.md`](BENCH.md) for the
+full methodology.
+
+## Documentation
+
+- [`docs/API.md`](docs/API.md) - complete API reference with examples.
+- [`REPS.md`](REPS.md) - formal project specification.
+- [`BENCH.md`](BENCH.md) - benchmark methodology and numbers.
+- [docs.rs/log-io](https://docs.rs/log-io) - generated rustdoc.
+
+## Examples
+
+The [`examples/`](examples) directory contains runnable demos:
+
+| Example          | Topic                                                 |
+|------------------|-------------------------------------------------------|
+| `basic`          | Minimal usage with the human format.                  |
+| `json`           | JSON output to stdout using macros.                   |
+| `context`        | Thread-local trace / request ID propagation.          |
+| `filter`         | Directive-style per-target filtering.                 |
+| `file_sink`      | Writing records to a file.                            |
+| `multi_sink`     | Fanning out one record to several destinations.       |
+| `custom_format`  | Implementing the `Format` trait yourself.             |
+| `custom_sink`    | Implementing the `Sink` trait yourself.               |
+| `default_fields` | Service-level fields attached once at builder time.   |
+
+Run any of them with `cargo run --example <name>`.
 
 ## License
 
