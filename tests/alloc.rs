@@ -166,3 +166,104 @@ fn filtered_out_records_are_allocation_free() {
     let n = allocations_during(|| logger.log(Level::Info, "hello", &fields));
     assert_eq!(n, 0, "filtered-out record allocated {n} times");
 }
+
+#[test]
+fn format_args_messages_are_allocation_free() {
+    let logger = Logger::builder()
+        .level(Level::Trace)
+        .writer(DevNull, JsonFormat::new())
+        .build();
+    let user = "alice";
+    let mut n = 0_u64;
+    let allocs = allocations_during(|| {
+        n += 1;
+        log_io::info!(
+            logger,
+            "user {user} request {n} took {} ms",
+            12.5,
+            http.status = 200_u16
+        );
+    });
+    assert_eq!(allocs, 0, "format_args message allocated {allocs} times");
+}
+
+#[test]
+fn key_collisions_and_redaction_are_allocation_free() {
+    let logger = Logger::builder()
+        .level(Level::Trace)
+        .with_default_field("service", "api")
+        .with_default_field("tenant", "default")
+        .redact_common_secrets()
+        .writer(DevNull, LogfmtFormat::new())
+        .build();
+    let _t = context::with_field("tenant", "ctx");
+    let fields = [
+        Field::new("tenant", "call"),
+        Field::new("password", "hunter2"),
+        Field::new("user", "alice"),
+    ];
+    let n = allocations_during(|| logger.log(Level::Info, "login", &fields));
+    assert_eq!(n, 0, "dedup + redaction allocated {n} times");
+}
+
+#[test]
+fn human_format_with_timestamps_is_allocation_free() {
+    let logger = Logger::builder()
+        .level(Level::Trace)
+        .writer(
+            DevNull,
+            HumanFormat::new().color(true).show_source_location(true),
+        )
+        .build();
+    let n = allocations_during(|| {
+        log_io::warn!(logger, "slow", ms = 412_u64, path = "/api users");
+    });
+    assert_eq!(n, 0, "human format allocated {n} times");
+}
+
+#[cfg(feature = "log")]
+#[test]
+fn log_bridge_is_allocation_free() {
+    use log::Log;
+    let logger = Logger::builder()
+        .level(Level::Trace)
+        .writer(DevNull, JsonFormat::new())
+        .build();
+    let bridge = log_io::compat::LogBridge::new(logger);
+    let kvs: &[(&str, log::kv::Value<'_>)] = &[
+        ("user", log::kv::Value::from("alice")),
+        ("n", log::kv::Value::from(3_u64)),
+    ];
+    let mut i = 0_u32;
+    let n = allocations_during(|| {
+        i += 1;
+        bridge.log(
+            &log::Record::builder()
+                .level(log::Level::Info)
+                .target("app")
+                .key_values(&kvs)
+                .args(format_args!("request {i}"))
+                .build(),
+        );
+    });
+    assert_eq!(n, 0, "log bridge allocated {n} times");
+}
+
+#[cfg(feature = "tracing")]
+#[test]
+fn tracing_layer_events_are_allocation_free() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let logger = Logger::builder()
+        .level(Level::Trace)
+        .writer(DevNull, JsonFormat::new())
+        .build();
+    let subscriber = tracing_subscriber::registry().with(log_io::compat::TracingLayer::new(logger));
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!("request", id = 7_u64, user = "alice");
+        let _entered = span.enter();
+        let n = allocations_during(|| {
+            tracing::info!(status = 200_u16, path = "/api", "handled {}", 42);
+        });
+        assert_eq!(n, 0, "tracing event allocated {n} times");
+    });
+}

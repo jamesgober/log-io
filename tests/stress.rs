@@ -6,6 +6,8 @@
 //! * panics inside sinks
 //! * deeply nested context scopes
 //! * empty / single-character inputs
+//! * real mutex poisoning, concurrent flushes, background writers and
+//!   failing sinks under contention
 
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -175,23 +177,178 @@ fn panic_inside_sink_does_not_poison_other_sinks() {
 
 #[test]
 fn mutex_poison_recovery_keeps_logger_alive() {
+    // The writer panics while the sink's mutex is held, which really
+    // poisons it (the 1.x version of this test poisoned nothing). Later
+    // records, from this and other threads, must still be written.
+    struct PanicOnce(AtomicUsize, Capture);
+    impl Write for PanicOnce {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("writer panic while holding the sink lock");
+            }
+            self.1.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
     let buf = Capture::default();
     let logger = Logger::builder()
         .level(Level::Trace)
         .no_timestamps()
         .no_context()
-        .writer(buf.clone(), JsonFormat::new())
+        .writer(
+            PanicOnce(AtomicUsize::new(0), buf.clone()),
+            JsonFormat::new(),
+        )
         .build();
 
-    // Poison the FORMAT_BUF thread-local by panicking mid-format on
-    // a worker thread, then verify the next thread can still log.
-    let _ = thread::spawn(|| {
-        panic!("kill the worker before formatting");
-    })
-    .join();
+    let poisoner = logger.clone();
+    let joined = thread::spawn(move || poisoner.log(Level::Info, "poison", &[])).join();
+    assert!(joined.is_err(), "the writer must have panicked");
 
     logger.log(Level::Info, "still here", &[]);
-    assert!(buf.dump().contains("\"message\":\"still here\""));
+    let other = logger.clone();
+    thread::spawn(move || other.log(Level::Info, "other thread", &[]))
+        .join()
+        .unwrap();
+    let out = buf.dump();
+    assert!(out.contains("\"message\":\"still here\""), "{out}");
+    assert!(out.contains("\"message\":\"other thread\""), "{out}");
+    assert!(!out.contains("poison"), "{out}");
+}
+
+#[test]
+fn concurrent_flushes_and_writes_lose_nothing() {
+    let path =
+        std::env::temp_dir().join(format!("log-io-stress-flush-{}.jsonl", std::process::id()));
+    let sink = log_io::sink::FileSink::create(&path, JsonFormat::new()).unwrap();
+    let logger = Logger::builder()
+        .level(Level::Trace)
+        .no_timestamps()
+        .no_context()
+        .with_sink(sink)
+        .build();
+    thread::scope(|s| {
+        for t in 0..8_u32 {
+            let logger = &logger;
+            s.spawn(move || {
+                for i in 0..500_u32 {
+                    logger.log(Level::Info, "w", &[Field::new("t", t), Field::new("i", i)]);
+                    if i % 50 == 0 {
+                        logger.flush().unwrap();
+                    }
+                }
+            });
+        }
+    });
+    logger.shutdown().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(text.lines().count(), 8 * 500);
+    for line in text.lines() {
+        let _: serde_json::Value = serde_json::from_str(line).unwrap();
+    }
+}
+
+#[test]
+fn non_blocking_under_many_producers_keeps_records_whole() {
+    let buf = Capture::default();
+    let sink = log_io::sink::NonBlocking::builder(buf.clone(), JsonFormat::new())
+        .capacity(64)
+        .build()
+        .unwrap();
+    let logger = Logger::builder()
+        .level(Level::Trace)
+        .no_timestamps()
+        .no_context()
+        .with_sink(sink)
+        .build();
+    thread::scope(|s| {
+        for t in 0..16_u32 {
+            let logger = &logger;
+            s.spawn(move || {
+                for i in 0..400_u32 {
+                    logger.log(Level::Info, "nb", &[Field::new("t", t), Field::new("i", i)]);
+                }
+            });
+        }
+    });
+    logger.shutdown().unwrap();
+    let out = buf.dump();
+    assert_eq!(out.lines().count(), 16 * 400);
+    for line in out.lines() {
+        let _: serde_json::Value = serde_json::from_str(line).unwrap();
+    }
+}
+
+#[test]
+fn failing_sink_under_contention_reports_every_failure() {
+    struct Bad;
+    impl Sink for Bad {
+        fn write_record(&self, _: &Record<'_>) -> Result<()> {
+            Err(log_io::Error::Closed)
+        }
+        fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls2 = Arc::clone(&calls);
+    let good = Capture::default();
+    let logger = Logger::builder()
+        .level(Level::Trace)
+        .no_timestamps()
+        .no_context()
+        .with_sink(Bad)
+        .writer(good.clone(), JsonFormat::new())
+        .on_error(Arc::new(move |_| {
+            calls2.fetch_add(1, Ordering::Relaxed);
+        }))
+        .build();
+    thread::scope(|s| {
+        for _ in 0..8 {
+            let logger = &logger;
+            s.spawn(move || {
+                for _ in 0..250 {
+                    logger.log(Level::Info, "x", &[]);
+                }
+            });
+        }
+    });
+    assert_eq!(calls.load(Ordering::Relaxed), 8 * 250);
+    assert_eq!(good.dump().lines().count(), 8 * 250);
+}
+
+#[test]
+fn context_stays_isolated_between_busy_threads() {
+    let buf = Capture::default();
+    let logger = Logger::builder()
+        .level(Level::Trace)
+        .no_timestamps()
+        .writer(buf.clone(), JsonFormat::new())
+        .build();
+    thread::scope(|s| {
+        for t in 0..8_u32 {
+            let logger = &logger;
+            s.spawn(move || {
+                let tenant = format!("tenant-{t}");
+                for i in 0..200_u32 {
+                    let _g = context::with_field("tenant", tenant.as_str());
+                    logger.log(
+                        Level::Info,
+                        "req",
+                        &[Field::new("t", t), Field::new("i", i)],
+                    );
+                }
+            });
+        }
+    });
+    for line in buf.dump().lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        let t = v["t"].as_u64().unwrap();
+        assert_eq!(v["tenant"], format!("tenant-{t}"), "{line}");
+    }
 }
 
 #[test]

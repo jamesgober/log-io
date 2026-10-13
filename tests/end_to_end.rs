@@ -375,3 +375,218 @@ fn dispatch_continues_when_one_sink_fails() {
     assert!(result.is_err()); // first sink error is surfaced ...
     assert!(buf.dump().contains("\"message\":\"m\"")); // ... but the second sink still got the record
 }
+
+#[test]
+fn macros_support_format_args_dotted_keys_and_sigils() {
+    let buf = Capture::default();
+    let logger = Logger::builder()
+        .level(Level::Trace)
+        .no_timestamps()
+        .no_context()
+        .writer(buf.clone(), JsonFormat::new())
+        .build();
+    let user = "alice";
+    let addr = std::net::Ipv4Addr::LOCALHOST;
+    let roles = vec!["admin"];
+    log_io::info!(
+        logger,
+        "user {user} from {} tried {}x",
+        addr,
+        3,
+        http.status = 401_u16,
+        "content-type" = "text/plain",
+        peer = %addr,
+        roles = ?roles,
+        n = 1_u8,
+    );
+    log_io::warn!(logger, target: "custom::target", "braces {{escaped}}");
+    let dynamic = String::from("dynamic message {not a format}");
+    log_io::error!(logger, dynamic.as_str(), code = 7_u8);
+    log_io::debug!(logger, &dynamic);
+
+    let out = buf.dump();
+    let lines: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 4, "{out}");
+    assert_eq!(lines[0]["message"], "user alice from 127.0.0.1 tried 3x");
+    assert_eq!(lines[0]["http.status"], 401);
+    assert_eq!(lines[0]["content-type"], "text/plain");
+    assert_eq!(lines[0]["peer"], "127.0.0.1");
+    assert_eq!(lines[0]["roles"], "[\"admin\"]");
+    assert_eq!(lines[0]["n"], 1);
+    assert_eq!(lines[0]["target"], "end_to_end");
+    assert!(
+        lines[0]["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("end_to_end.rs")
+    );
+    assert_eq!(lines[1]["target"], "custom::target");
+    assert_eq!(lines[1]["message"], "braces {escaped}");
+    assert_eq!(lines[2]["message"], "dynamic message {not a format}");
+    assert_eq!(lines[2]["code"], 7);
+    assert_eq!(lines[3]["level"], "debug");
+}
+
+#[test]
+fn macros_accept_logger_references_and_arcs() {
+    let buf = Capture::default();
+    let logger = Arc::new(json_logger(buf.clone()));
+    let by_ref: &Logger = &logger;
+    log_io::info!(logger, "arc");
+    log_io::info!(by_ref, "ref");
+    log_io::info!(&by_ref, "double ref");
+    log_io::log_at!(*by_ref, Level::Warn, "deref");
+    assert_eq!(buf.dump().lines().count(), 4);
+}
+
+#[test]
+fn file_and_rotating_sinks_work_through_a_logger() {
+    use log_io::sink::{FileSink, RotatingFile, RotatingFileSink};
+
+    let dir = std::env::temp_dir().join(format!("log-io-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let file = FileSink::create(dir.join("plain.jsonl"), JsonFormat::new()).unwrap();
+    let rotating = RotatingFile::builder(dir.join("rot.log"))
+        .max_bytes(256)
+        .max_files(2)
+        .open()
+        .unwrap();
+    let logger = Logger::builder()
+        .level(Level::Trace)
+        .no_timestamps()
+        .no_context()
+        .with_sink(file)
+        .with_sink(RotatingFileSink::new(rotating, LogfmtFormat::new()))
+        .build();
+    for i in 0..20_u32 {
+        log_io::info!(logger, "record", i = i);
+    }
+    drop(logger); // flushes and shuts every sink down
+
+    let plain = std::fs::read_to_string(dir.join("plain.jsonl")).unwrap();
+    assert_eq!(plain.lines().count(), 20);
+    assert!(dir.join("rot.log.1").exists());
+    assert!(dir.join("rot.log.2").exists());
+    assert!(!dir.join("rot.log.3").exists());
+    let newest = std::fs::read_to_string(dir.join("rot.log")).unwrap();
+    assert!(newest.contains("i=19"), "{newest}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn non_blocking_sink_through_a_logger_flushes_on_error() {
+    let buf = Capture::default();
+    let sink = log_io::sink::NonBlocking::new(buf.clone(), JsonFormat::new()).unwrap();
+    let logger = Logger::builder()
+        .level(Level::Trace)
+        .no_timestamps()
+        .no_context()
+        .with_sink(sink)
+        .build();
+    log_io::info!(logger, "queued");
+    log_io::error!(logger, "flush-on-error waits for the worker");
+    // No explicit flush: the error record forced one.
+    assert_eq!(buf.dump().lines().count(), 2);
+}
+
+#[test]
+fn context_snapshot_follows_a_future_across_threads() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct Noop;
+    impl Wake for Noop {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    /// Logs once per poll and yields twice before completing.
+    struct Steps<'a> {
+        logger: &'a Logger,
+        polls: u8,
+    }
+    impl Future for Steps<'_> {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let step = self.polls;
+            log_io::info!(self.logger, "step", n = step);
+            self.polls += 1;
+            if self.polls == 3 {
+                Poll::Ready(())
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    let buf = Capture::default();
+    let logger = Logger::builder()
+        .level(Level::Trace)
+        .no_timestamps()
+        .writer(buf.clone(), JsonFormat::new())
+        .build();
+
+    context::clear();
+    let snapshot = {
+        let _req = context::with_request_id("req-42");
+        context::capture()
+    };
+    let mut task = snapshot.wrap(Steps {
+        logger: &logger,
+        polls: 0,
+    });
+
+    // Poll on three different threads, like a work-stealing executor.
+    for _ in 0..3 {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let waker = Waker::from(Arc::new(Noop));
+                let mut cx = Context::from_waker(&waker);
+                let _ = Pin::new(&mut task).poll(&mut cx);
+                assert_eq!(context::len(), 0, "nothing left behind on the worker");
+            });
+        });
+    }
+    // Records from an unrelated thread carry no request id.
+    logger.log(Level::Info, "unrelated", &[]);
+
+    let lines: Vec<serde_json::Value> = buf
+        .dump()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 4);
+    for line in &lines[..3] {
+        assert_eq!(line["request_id"], "req-42");
+    }
+    assert!(lines[3].get("request_id").is_none());
+}
+
+#[test]
+fn flush_guard_flushes_a_non_global_logger() {
+    let path = std::env::temp_dir().join(format!("log-io-guard-{}.jsonl", std::process::id()));
+    let sink = log_io::sink::FileSink::create(&path, JsonFormat::new()).unwrap();
+    let logger = Logger::builder()
+        .level(Level::Trace)
+        .no_timestamps()
+        .with_sink(sink)
+        .build();
+    {
+        let _guard = logger.flush_guard();
+        log_io::info!(logger, "buffered");
+        assert_eq!(
+            std::fs::read(&path).unwrap().len(),
+            0,
+            "still in the buffer"
+        );
+    }
+    assert!(std::fs::read_to_string(&path).unwrap().contains("buffered"));
+    drop(logger);
+    let _ = std::fs::remove_file(&path);
+}

@@ -47,8 +47,10 @@ tracing-core = { version = "0.1.32", optional = true, default-features = false, 
 tracing-subscriber = { version = "0.3.18", optional = true, default-features = false, features = ["std"] }
 
 [dev-dependencies]
-# Validates JSON output in tests (every record must parse).
-serde_json = "1"
+# Validates JSON output in tests (every record must parse). The
+# `float_roundtrip` feature makes its float parser exact, so tests can
+# check that every f64 survives a write/parse cycle bit for bit.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 # Drive the `tracing` bridge in tests and examples.
 tracing = { version = "0.1.40", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.18", default-features = false, features = ["std", "registry"] }
@@ -150,3 +152,15 @@ required-features = ["std", "json", "logfmt", "human"]
 [[test]]
 name = "alloc"
 required-features = ["std", "json", "logfmt", "human"]
+
+[[test]]
+name = "regressions"
+required-features = ["std", "json", "logfmt", "human"]
+
+[[test]]
+name = "durability"
+required-features = ["std", "json"]
+
+[[test]]
+name = "global"
+required-features = ["std", "logfmt"]
