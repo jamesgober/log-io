@@ -34,28 +34,34 @@ fn format_benches(c: &mut Criterion) {
     group.bench_function("json_5_fields", |b| {
         b.iter(|| {
             buf.clear();
-            json.write_record(black_box(&record), &mut buf).unwrap();
+            json.write_record_generic(black_box(&record), &mut buf)
+                .unwrap();
             black_box(buf.len())
         });
     });
     group.bench_function("logfmt_5_fields", |b| {
         b.iter(|| {
             buf.clear();
-            logfmt.write_record(black_box(&record), &mut buf).unwrap();
+            logfmt
+                .write_record_generic(black_box(&record), &mut buf)
+                .unwrap();
             black_box(buf.len())
         });
     });
     group.bench_function("human_5_fields", |b| {
         b.iter(|| {
             buf.clear();
-            human.write_record(black_box(&record), &mut buf).unwrap();
+            human
+                .write_record_generic(black_box(&record), &mut buf)
+                .unwrap();
             black_box(buf.len())
         });
     });
     group.bench_function("json_no_fields", |b| {
         b.iter(|| {
             buf.clear();
-            json.write_record(black_box(&empty), &mut buf).unwrap();
+            json.write_record_generic(black_box(&empty), &mut buf)
+                .unwrap();
             black_box(buf.len())
         });
     });

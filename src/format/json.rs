@@ -1,38 +1,45 @@
 //! JSON output format.
 //!
-//! Emits one JSON object per record terminated by a newline. The
-//! field ordering is stable so consumers can pattern-match on prefixes:
-//! `timestamp` (if set) -> `level` -> `target` -> `message` -> source
-//! location -> context fields -> structured fields.
+//! Emits one JSON object per record, terminated by a newline (JSON
+//! Lines). Key order is stable so consumers can rely on prefixes:
+//! `timestamp` (if set), `level`, `target`, `message`, `file` and
+//! `line` (if set), then context fields, then per-call fields.
 
 use core::fmt;
+use core::fmt::Write as _;
 
 use super::Format;
+use super::escape::{JsonEscaper, RESERVED_PREFIX, is_reserved_key, write_json_escaped};
 use crate::record::Record;
-use crate::value::Value;
+use crate::value::{Value, write_hex};
 
 /// JSON formatter.
 ///
-/// The default configuration emits compact JSON with a trailing
-/// newline. Set [`Self::pretty`] for an indented form intended for
-/// developer eyeballs, not machine ingestion.
+/// The default configuration emits compact JSON Lines. Every string is
+/// escaped so the output is valid JSON for any input, and the escaping
+/// also covers DEL, C1 controls, U+2028/U+2029 and bidi controls so a
+/// record stays on one line even for tools that treat those as line
+/// breaks. User keys named `timestamp`, `level`, `target`, `message`,
+/// `file` or `line` are written as `fields.<name>`.
 ///
-/// # Example
+/// # Examples
 ///
 /// ```
 /// use log_io::format::{Format, JsonFormat};
 /// use log_io::{Field, Level, Metadata, Record, Value};
 ///
 /// let fmt = JsonFormat::new();
-/// let fields = [Field::new("port", Value::U64(8080))];
+/// let fields = [Field::new("port", 8080_u16), Field::new("level", "spoofed")];
 /// let record = Record::new(Metadata::new(Level::Info, "app"), "started", &fields);
 ///
 /// let mut out = String::new();
-/// fmt.write_record(&record, &mut out).unwrap();
-///
-/// assert!(out.starts_with('{'));
-/// assert!(out.ends_with("}\n"));
-/// assert!(out.contains("\"port\":8080"));
+/// fmt.write_record(&record, &mut out)?;
+/// assert_eq!(
+///     out,
+///     "{\"level\":\"info\",\"target\":\"app\",\"message\":\"started\",\
+///       \"port\":8080,\"fields.level\":\"spoofed\"}\n"
+/// );
+/// # Ok::<(), core::fmt::Error>(())
 /// ```
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JsonFormat {
@@ -42,6 +49,7 @@ pub struct JsonFormat {
 
 impl JsonFormat {
     /// New compact JSON formatter. Equivalent to `Self::default()`.
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             pretty: false,
@@ -49,178 +57,170 @@ impl JsonFormat {
         }
     }
 
-    /// Toggle pretty (multi-line, indented) output.
+    /// Toggle pretty (multi-line, indented) output. Intended for
+    /// reading by eye; line-oriented ingestion needs the compact form.
+    #[must_use]
     pub const fn pretty(mut self, enabled: bool) -> Self {
         self.pretty = enabled;
         self
     }
 
-    /// Emit timestamps as RFC 3339 strings instead of unix nanoseconds.
+    /// Emit timestamps as RFC 3339 strings instead of Unix nanoseconds.
     ///
-    /// When enabled and a record's timestamp is present, the output
-    /// looks like `"timestamp":"2026-05-18T13:24:01.123456789Z"`. When
-    /// disabled (default), it is `"timestamp":1700000000000000000`.
+    /// Enabled: `"timestamp":"2023-11-14T22:13:20.000000000Z"`.
+    /// Disabled (default): `"timestamp":1700000000000000000`. Note that
+    /// nanosecond integers exceed 2^53, so consumers that parse JSON
+    /// numbers as doubles lose sub-microsecond precision; prefer the
+    /// RFC 3339 form for such consumers.
+    #[must_use]
     pub const fn timestamp_rfc3339(mut self, enabled: bool) -> Self {
         self.timestamp_rfc3339 = enabled;
         self
     }
+
+    fn write_impl<W: fmt::Write + ?Sized>(&self, record: &Record<'_>, w: &mut W) -> fmt::Result {
+        let mut out = Writer {
+            w,
+            pretty: self.pretty,
+            first: true,
+        };
+        out.w.write_char('{')?;
+        if let Some(ts) = record.metadata.timestamp_unix_nanos {
+            out.key_raw("timestamp")?;
+            if self.timestamp_rfc3339 {
+                out.w.write_char('"')?;
+                super::rfc3339::write_rfc3339_nanos(ts, out.w)?;
+                out.w.write_char('"')?;
+            } else {
+                write!(out.w, "{ts}")?;
+            }
+        }
+        out.key_raw("level")?;
+        out.w.write_char('"')?;
+        out.w.write_str(record.metadata.level.as_str())?;
+        out.w.write_char('"')?;
+
+        out.key_raw("target")?;
+        write_string(out.w, record.metadata.target)?;
+
+        out.key_raw("message")?;
+        write_string(out.w, record.message)?;
+
+        if let Some(file) = record.metadata.file {
+            out.key_raw("file")?;
+            write_string(out.w, file)?;
+        }
+        if let Some(line) = record.metadata.line {
+            out.key_raw("line")?;
+            write!(out.w, "{line}")?;
+        }
+
+        for field in record.all_fields() {
+            out.key_user(field.key)?;
+            write_value(out.w, field.value)?;
+        }
+
+        if self.pretty {
+            out.w.write_char('\n')?;
+        }
+        out.w.write_str("}\n")
+    }
 }
 
 impl Format for JsonFormat {
-    fn write_record<W: fmt::Write + ?Sized>(
+    fn write_record(&self, record: &Record<'_>, writer: &mut dyn fmt::Write) -> fmt::Result {
+        self.write_impl(record, writer)
+    }
+
+    #[inline]
+    fn write_record_generic<W: fmt::Write>(
         &self,
         record: &Record<'_>,
         writer: &mut W,
     ) -> fmt::Result {
-        let nl = if self.pretty { "\n" } else { "" };
-        let ind = if self.pretty { "  " } else { "" };
-        let sp = if self.pretty { " " } else { "" };
+        self.write_impl(record, writer)
+    }
+}
 
-        writer.write_char('{')?;
-        writer.write_str(nl)?;
+/// Tracks separators while an object is being written.
+struct Writer<'w, W: ?Sized> {
+    w: &'w mut W,
+    pretty: bool,
+    first: bool,
+}
 
-        let mut first = true;
-
-        if let Some(ts) = record.metadata.timestamp_unix_nanos {
-            comma(writer, &mut first, nl, ind)?;
-            writer.write_str("\"timestamp\":")?;
-            writer.write_str(sp)?;
-            if self.timestamp_rfc3339 {
-                writer.write_char('"')?;
-                crate::format::rfc3339::write_rfc3339_nanos(ts, writer)?;
-                writer.write_char('"')?;
-            } else {
-                write!(writer, "{ts}")?;
-            }
+impl<W: fmt::Write + ?Sized> Writer<'_, W> {
+    #[inline]
+    fn separator(&mut self) -> fmt::Result {
+        if self.first {
+            self.first = false;
+        } else {
+            self.w.write_char(',')?;
         }
-
-        comma(writer, &mut first, nl, ind)?;
-        writer.write_str("\"level\":")?;
-        writer.write_str(sp)?;
-        writer.write_char('"')?;
-        writer.write_str(record.metadata.level.as_str())?;
-        writer.write_char('"')?;
-
-        comma(writer, &mut first, nl, ind)?;
-        writer.write_str("\"target\":")?;
-        writer.write_str(sp)?;
-        write_json_str(writer, record.metadata.target)?;
-
-        comma(writer, &mut first, nl, ind)?;
-        writer.write_str("\"message\":")?;
-        writer.write_str(sp)?;
-        write_json_str(writer, record.message)?;
-
-        if let Some(file) = record.metadata.file {
-            comma(writer, &mut first, nl, ind)?;
-            writer.write_str("\"file\":")?;
-            writer.write_str(sp)?;
-            write_json_str(writer, file)?;
-        }
-        if let Some(line) = record.metadata.line {
-            comma(writer, &mut first, nl, ind)?;
-            writer.write_str("\"line\":")?;
-            writer.write_str(sp)?;
-            write!(writer, "{line}")?;
-        }
-
-        for field in record.all_fields() {
-            comma(writer, &mut first, nl, ind)?;
-            write_json_str(writer, field.key)?;
-            writer.write_char(':')?;
-            writer.write_str(sp)?;
-            write_json_value(writer, field.value)?;
-        }
-
         if self.pretty {
-            writer.write_char('\n')?;
+            self.w.write_str("\n  ")?;
         }
-        writer.write_char('}')?;
-        writer.write_char('\n')?;
         Ok(())
     }
-}
 
-fn comma<W: fmt::Write + ?Sized>(w: &mut W, first: &mut bool, nl: &str, ind: &str) -> fmt::Result {
-    if *first {
-        *first = false;
-    } else {
-        w.write_char(',')?;
-        w.write_str(nl)?;
+    /// A key the formatter itself controls (already valid JSON text).
+    #[inline]
+    fn key_raw(&mut self, key: &str) -> fmt::Result {
+        self.separator()?;
+        self.w.write_char('"')?;
+        self.w.write_str(key)?;
+        self.w.write_str(if self.pretty { "\": " } else { "\":" })
     }
-    w.write_str(ind)?;
-    Ok(())
+
+    /// A user key: escaped, and prefixed when it collides with a
+    /// reserved key.
+    #[inline]
+    fn key_user(&mut self, key: &str) -> fmt::Result {
+        self.separator()?;
+        self.w.write_char('"')?;
+        if is_reserved_key(key) {
+            self.w.write_str(RESERVED_PREFIX)?;
+        }
+        write_json_escaped(self.w, key)?;
+        self.w.write_str(if self.pretty { "\": " } else { "\":" })
+    }
 }
 
-fn write_json_str<W: fmt::Write + ?Sized>(w: &mut W, s: &str) -> fmt::Result {
+#[inline]
+fn write_string<W: fmt::Write + ?Sized>(w: &mut W, s: &str) -> fmt::Result {
     w.write_char('"')?;
-    // Batched escape: scan the string for the next byte that needs
-    // escaping, write the clean run as one chunk, then emit the
-    // escape, then repeat. UTF-8 is preserved because the bytes that
-    // need escaping (ASCII control + " + \) are all single-byte.
-    let bytes = s.as_bytes();
-    let mut start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        let escape: Option<&'static str> = match b {
-            b'"' => Some("\\\""),
-            b'\\' => Some("\\\\"),
-            b'\n' => Some("\\n"),
-            b'\r' => Some("\\r"),
-            b'\t' => Some("\\t"),
-            0x08 => Some("\\b"),
-            0x0c => Some("\\f"),
-            0x00..=0x1F => None, // generic \u00XX path below
-            _ => {
-                i += 1;
-                continue;
-            }
-        };
-        if start < i {
-            // SAFETY-equivalent: the clean run is valid UTF-8 because
-            // we only skipped past non-escape bytes; all such bytes
-            // are either ASCII (single byte) or UTF-8 continuation /
-            // leading bytes that we copied as a contiguous slice.
-            w.write_str(&s[start..i])?;
-        }
-        if let Some(seq) = escape {
-            w.write_str(seq)?;
-        } else {
-            write!(w, "\\u{:04x}", b)?;
-        }
-        i += 1;
-        start = i;
-    }
-    if start < bytes.len() {
-        w.write_str(&s[start..])?;
-    }
+    write_json_escaped(w, s)?;
     w.write_char('"')
 }
 
-fn write_json_value<W: fmt::Write + ?Sized>(w: &mut W, v: Value<'_>) -> fmt::Result {
+fn write_value<W: fmt::Write + ?Sized>(w: &mut W, v: Value<'_>) -> fmt::Result {
     match v {
         Value::Null => w.write_str("null"),
         Value::Bool(true) => w.write_str("true"),
         Value::Bool(false) => w.write_str("false"),
         Value::I64(n) => write!(w, "{n}"),
         Value::U64(n) => write!(w, "{n}"),
-        Value::F64(n) => {
-            if n.is_finite() {
-                // Use Rust's default float formatting; it round-trips
-                // and never emits trailing dots.
-                write!(w, "{n}")
-            } else {
-                w.write_str("null")
-            }
-        }
-        Value::Str(s) => write_json_str(w, s),
+        Value::I128(n) => write!(w, "{n}"),
+        Value::U128(n) => write!(w, "{n}"),
+        // `{:?}` always round-trips and always includes `.` or an
+        // exponent, so `1.0` stays a float for schema-inferring
+        // consumers and huge or tiny values stay short.
+        Value::F64(n) if n.is_finite() => write!(w, "{n:?}"),
+        Value::F64(_) => w.write_str("null"),
+        Value::Str(s) => write_string(w, s),
         Value::Char(c) => {
-            // One-character string. Use the string path so escaping
-            // applies (the char might be a quote or control byte).
-            let mut buf = [0u8; 4];
-            let s: &str = c.encode_utf8(&mut buf);
-            write_json_str(w, s)
+            let mut buf = [0_u8; 4];
+            write_string(w, c.encode_utf8(&mut buf))
+        }
+        Value::Bytes(b) => {
+            w.write_char('"')?;
+            write_hex(w, b)?;
+            w.write_char('"')
+        }
+        lazy @ (Value::Display(_) | Value::Debug(_) | Value::Error(_)) => {
+            w.write_char('"')?;
+            write!(JsonEscaper(&mut *w), "{lazy}")?;
+            w.write_char('"')
         }
     }
 }
@@ -233,99 +233,124 @@ mod tests {
 
     fn fmt_one(json: JsonFormat, record: &Record<'_>) -> String {
         let mut s = String::new();
-        json.write_record(record, &mut s).unwrap();
+        json.write_record_generic(record, &mut s).unwrap();
+        let mut d = String::new();
+        json.write_record(record, &mut d).unwrap();
+        assert_eq!(s, d);
         s
     }
 
-    #[test]
-    fn compact_object_with_trailing_newline() {
-        let record = Record::new(Metadata::new(Level::Info, "app"), "hello", &[]);
+    fn field_json(v: Value<'_>) -> String {
+        let fields = [Field::new("v", v)];
+        let record = Record::new(Metadata::new(Level::Info, "t"), "m", &fields);
         let out = fmt_one(JsonFormat::new(), &record);
+        let start = out.find("\"v\":").unwrap() + 4;
+        out[start..out.len() - 2].to_string()
+    }
+
+    #[test]
+    fn test_json_compact_object_with_trailing_newline() {
+        let record = Record::new(Metadata::new(Level::Info, "app"), "hello", &[]);
         assert_eq!(
-            out,
+            fmt_one(JsonFormat::new(), &record),
             "{\"level\":\"info\",\"target\":\"app\",\"message\":\"hello\"}\n"
         );
     }
 
     #[test]
-    fn fields_appear_after_message() {
-        let fields = [
-            Field::new("port", Value::U64(8080)),
-            Field::new("host", Value::Str("0.0.0.0")),
-        ];
-        let record = Record::new(Metadata::new(Level::Info, "app"), "up", &fields);
-        let out = fmt_one(JsonFormat::new(), &record);
-        let msg_pos = out.find("\"message\":\"up\"").unwrap();
-        let port_pos = out.find("\"port\":8080").unwrap();
-        assert!(msg_pos < port_pos);
-        assert!(out.contains("\"host\":\"0.0.0.0\""));
+    fn test_json_metadata_order_is_stable() {
+        let meta = Metadata::new(Level::Warn, "a")
+            .with_location("f.rs", 7)
+            .with_timestamp(5);
+        let record = Record::new(meta, "m", &[]);
+        assert_eq!(
+            fmt_one(JsonFormat::new(), &record),
+            "{\"timestamp\":5,\"level\":\"warn\",\"target\":\"a\",\"message\":\"m\",\
+             \"file\":\"f.rs\",\"line\":7}\n"
+        );
     }
 
     #[test]
-    fn context_appears_before_fields() {
-        let ctx = [Field::new("trace_id", Value::Str("abc"))];
-        let fields = [Field::new("port", Value::U64(80))];
+    fn test_json_context_before_fields() {
+        let ctx = [Field::new("trace_id", "abc")];
+        let fields = [Field::new("port", 80_u32)];
         let record = Record::with_context(Metadata::new(Level::Info, "app"), "msg", &fields, &ctx);
         let out = fmt_one(JsonFormat::new(), &record);
-        let trace_pos = out.find("\"trace_id\"").unwrap();
-        let port_pos = out.find("\"port\"").unwrap();
-        assert!(trace_pos < port_pos);
+        assert!(out.find("\"trace_id\"").unwrap() < out.find("\"port\"").unwrap());
     }
 
     #[test]
-    fn escapes_control_and_quotes() {
-        let fields = [Field::new("data", Value::Str("a\"b\nc\td"))];
-        let record = Record::new(Metadata::new(Level::Info, "t"), "x", &fields);
-        let out = fmt_one(JsonFormat::new(), &record);
-        assert!(out.contains(r#""data":"a\"b\nc\td""#), "{out}");
+    fn test_json_values_render_per_variant() {
+        assert_eq!(field_json(Value::Null), "null");
+        assert_eq!(field_json(Value::Bool(true)), "true");
+        assert_eq!(field_json(Value::Bool(false)), "false");
+        assert_eq!(field_json(Value::I64(-3)), "-3");
+        assert_eq!(field_json(Value::U64(3)), "3");
+        assert_eq!(field_json(Value::I128(i128::MIN)), i128::MIN.to_string());
+        assert_eq!(field_json(Value::U128(u128::MAX)), u128::MAX.to_string());
+        assert_eq!(field_json(Value::F64(1.0)), "1.0");
+        assert_eq!(field_json(Value::F64(1.5)), "1.5");
+        assert_eq!(field_json(Value::F64(1e300)), "1e300");
+        assert_eq!(field_json(Value::F64(f64::NAN)), "null");
+        assert_eq!(field_json(Value::F64(f64::NEG_INFINITY)), "null");
+        assert_eq!(field_json(Value::Str("a\"b\nc")), "\"a\\\"b\\nc\"");
+        assert_eq!(field_json(Value::Char('\n')), "\"\\n\"");
+        assert_eq!(field_json(Value::Char('"')), "\"\\\"\"");
+        assert_eq!(field_json(Value::Bytes(&[0xde, 0xad])), "\"dead\"");
+        assert_eq!(field_json(Value::Display(&"x\ty")), "\"x\\ty\"");
+        assert_eq!(field_json(Value::Debug(&"q")), "\"\\\"q\\\"\"");
+        let e = std::io::Error::other("disk \"full\"");
+        assert_eq!(field_json(Value::Error(&e)), "\"disk \\\"full\\\"\"");
     }
 
     #[test]
-    fn escapes_low_codepoint_to_unicode() {
-        let fields = [Field::new("data", Value::Str("\x01"))];
-        let record = Record::new(Metadata::new(Level::Info, "t"), "x", &fields);
-        let out = fmt_one(JsonFormat::new(), &record);
-        let backslash = "\\";
-        let expected = format!("\"data\":\"{}u0001\"", backslash);
-        assert!(out.contains(&expected), "{}", out);
-    }
-
-    #[test]
-    fn nan_inf_become_null() {
+    fn test_json_reserved_keys_are_prefixed() {
         let fields = [
-            Field::new("a", Value::F64(f64::NAN)),
-            Field::new("b", Value::F64(f64::INFINITY)),
-            Field::new("c", Value::F64(1.5)),
+            Field::new("level", "fake"),
+            Field::new("message", "spoofed"),
+            Field::new("timestamp", 0_u32),
+            Field::new("target", "x"),
+            Field::new("file", "y"),
+            Field::new("line", 1_u32),
+            Field::new("levels", "not reserved"),
         ];
-        let record = Record::new(Metadata::new(Level::Info, "t"), "x", &fields);
+        let record = Record::new(Metadata::new(Level::Error, "t"), "real", &fields);
         let out = fmt_one(JsonFormat::new(), &record);
-        assert!(out.contains("\"a\":null"));
-        assert!(out.contains("\"b\":null"));
-        assert!(out.contains("\"c\":1.5"));
+        assert_eq!(out.matches("\"level\":").count(), 1, "{out}");
+        assert_eq!(out.matches("\"message\":").count(), 1, "{out}");
+        for k in ["level", "message", "timestamp", "target", "file", "line"] {
+            assert!(out.contains(&format!("\"fields.{k}\":")), "{k}: {out}");
+        }
+        assert!(out.contains("\"levels\":"), "{out}");
     }
 
     #[test]
-    fn timestamp_unix_nanos_default() {
-        let metadata = Metadata::new(Level::Info, "t").with_timestamp(1_700_000_000_000_000_000);
-        let record = Record::new(metadata, "x", &[]);
+    fn test_json_keys_are_escaped() {
+        let fields = [Field::new("we\"ird\n", 1_u32)];
+        let record = Record::new(Metadata::new(Level::Info, "t"), "m", &fields);
         let out = fmt_one(JsonFormat::new(), &record);
-        assert!(out.contains("\"timestamp\":1700000000000000000"));
+        assert!(out.contains("\"we\\\"ird\\n\":1"), "{out}");
     }
 
     #[test]
-    fn timestamp_rfc3339_when_enabled() {
-        let metadata = Metadata::new(Level::Info, "t").with_timestamp(1_700_000_000_000_000_000);
-        let record = Record::new(metadata, "x", &[]);
-        let out = fmt_one(JsonFormat::new().timestamp_rfc3339(true), &record);
-        assert!(out.contains("\"timestamp\":\"2023-11-14T22:13:20"), "{out}");
+    fn test_json_timestamp_forms() {
+        let meta = Metadata::new(Level::Info, "t").with_timestamp(1_700_000_000_000_000_000);
+        let record = Record::new(meta, "x", &[]);
+        assert!(fmt_one(JsonFormat::new(), &record).contains("\"timestamp\":1700000000000000000"));
+        assert!(
+            fmt_one(JsonFormat::new().timestamp_rfc3339(true), &record)
+                .contains("\"timestamp\":\"2023-11-14T22:13:20.000000000Z\"")
+        );
     }
 
     #[test]
-    fn pretty_indents_and_breaks_lines() {
-        let fields = [Field::new("port", Value::U64(80))];
+    fn test_json_pretty_indents_and_breaks_lines() {
+        let fields = [Field::new("port", 80_u32)];
         let record = Record::new(Metadata::new(Level::Info, "t"), "x", &fields);
         let out = fmt_one(JsonFormat::new().pretty(true), &record);
-        assert!(out.contains("\n  \"level\": \"info\""), "{out}");
-        assert!(out.ends_with("}\n"));
+        assert_eq!(
+            out,
+            "{\n  \"level\": \"info\",\n  \"target\": \"t\",\n  \"message\": \"x\",\n  \"port\": 80\n}\n"
+        );
     }
 }

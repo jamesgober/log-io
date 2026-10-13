@@ -35,8 +35,23 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
+# Optional integrations, each behind its own non-default feature. The
+# default build has zero dependencies.
+#
+# `log`: the de-facto logging facade; `LogBridge` implements `log::Log`.
+log = { version = "0.4.21", optional = true, default-features = false, features = ["std", "kv"] }
+# `tracing-core` + `tracing-subscriber`: `TracingLayer` implements
+# `tracing_subscriber::Layer`. Only their `std` features are enabled;
+# applications bring the span registry (`tracing-subscriber/registry`).
+tracing-core = { version = "0.1.32", optional = true, default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.18", optional = true, default-features = false, features = ["std"] }
 
 [dev-dependencies]
+# Validates JSON output in tests (every record must parse).
+serde_json = "1"
+# Drive the `tracing` bridge in tests and examples.
+tracing = { version = "0.1.40", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.18", default-features = false, features = ["std", "registry"] }
 criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 
@@ -49,6 +64,8 @@ std = []
 json = []
 logfmt = []
 human = []
+log = ["std", "dep:log"]
+tracing = ["std", "dep:tracing-core", "dep:tracing-subscriber"]
 
 [profile.release]
 opt-level = 3
@@ -70,40 +87,52 @@ harness = false
 required-features = ["std", "json"]
 
 [[example]]
-name = "basic"
+name = "01_quick_start"
 required-features = ["std", "human"]
 
 [[example]]
-name = "json"
+name = "02_macros"
 required-features = ["std", "json"]
 
 [[example]]
-name = "context"
+name = "03_context"
 required-features = ["std", "logfmt"]
 
 [[example]]
-name = "filter"
+name = "04_filter"
 required-features = ["std", "human"]
 
 [[example]]
-name = "file_sink"
+name = "05_file_sink"
 required-features = ["std", "json"]
 
 [[example]]
-name = "multi_sink"
+name = "06_multi_sink"
 required-features = ["std", "json", "human"]
 
 [[example]]
-name = "custom_format"
-required-features = ["std"]
-
-[[example]]
-name = "custom_sink"
+name = "07_default_fields_and_redaction"
 required-features = ["std", "json"]
 
 [[example]]
-name = "default_fields"
+name = "08_custom_format"
 required-features = ["std", "json"]
+
+[[example]]
+name = "09_custom_sink"
+required-features = ["std", "json"]
+
+[[example]]
+name = "10_non_blocking"
+required-features = ["std", "json"]
+
+[[example]]
+name = "11_log_bridge"
+required-features = ["log", "logfmt"]
+
+[[example]]
+name = "12_tracing_layer"
+required-features = ["tracing", "json"]
 
 [[test]]
 name = "end_to_end"

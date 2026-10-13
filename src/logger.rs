@@ -1,148 +1,251 @@
-//! The top-level [`Logger`] and its [`LoggerBuilder`].
+//! The [`Logger`]: filter, assemble, dispatch.
 //!
-//! A `Logger` bundles a [`Filter`] gate, one or more [`Sink`]s, and
-//! (when std is available) timestamping and thread-local context
-//! propagation. Cloning a `Logger` clones a pair of `Arc`s; the
-//! underlying sinks are shared.
+//! A `Logger` bundles a [`Filter`], one or more [`Sink`]s, optional
+//! timestamping, thread-local context capture, default fields,
+//! redaction, and the flush policy. Cloning a `Logger` clones an `Arc`;
+//! all clones share the same sinks.
 
-use std::io::Write;
+use core::cell::{Cell, RefCell};
+use core::fmt;
 use std::sync::Arc;
 
 use crate::context;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::filter::Filter;
-use crate::format::Format;
 use crate::level::Level;
 use crate::record::{Field, Metadata, Record};
-use crate::sink::{Sink, StderrSink, StdoutSink, WriterSink};
+use crate::sink::{Sink, trim_buffer};
 use crate::time;
-use crate::value::Value;
+use crate::value::{OwnedField, Value};
 
-/// Owned counterpart of [`Value`], used for default fields stored in
-/// the logger.
-#[derive(Debug, Clone)]
-enum OwnedValue {
-    Null,
-    Bool(bool),
-    I64(i64),
-    U64(u64),
-    F64(f64),
-    Str(String),
-    Char(char),
-}
+use crate::builder::LoggerBuilder;
 
-impl OwnedValue {
-    fn as_value(&self) -> Value<'_> {
-        match self {
-            Self::Null => Value::Null,
-            Self::Bool(b) => Value::Bool(*b),
-            Self::I64(n) => Value::I64(*n),
-            Self::U64(n) => Value::U64(*n),
-            Self::F64(n) => Value::F64(*n),
-            Self::Str(s) => Value::Str(s.as_str()),
-            Self::Char(c) => Value::Char(*c),
-        }
-    }
-
-    fn from_value(v: Value<'_>) -> Self {
-        match v {
-            Value::Null => Self::Null,
-            Value::Bool(b) => Self::Bool(b),
-            Value::I64(n) => Self::I64(n),
-            Value::U64(n) => Self::U64(n),
-            Value::F64(n) => Self::F64(n),
-            Value::Str(s) => Self::Str(s.to_owned()),
-            Value::Char(c) => Self::Char(c),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct OwnedField {
-    key: String,
-    value: OwnedValue,
-}
-
-/// Optional handler invoked when a sink returns an error.
+/// Callback invoked for every sink error, flush error, and message
+/// formatting error the logger encounters.
 ///
-/// The default behavior of [`Logger::log`] is to silently swallow sink
-/// errors. Install an error handler to surface them (typically to
-/// stderr) without taking down the calling thread.
-pub type ErrorHandler = Arc<dyn Fn(&crate::error::Error) + Send + Sync>;
+/// The handler runs on the thread that logged the record. If the
+/// handler itself logs through a logger whose sink keeps failing, the
+/// nested failures are not reported again (a per-thread guard prevents
+/// unbounded recursion), but the nested records are still dispatched.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use log_io::{ErrorHandler, Logger};
+///
+/// let handler: ErrorHandler = Arc::new(|err| eprintln!("logging failed: {err}"));
+/// let logger = Logger::builder().stderr_logfmt().on_error(handler).build();
+/// # let _ = logger;
+/// ```
+pub type ErrorHandler = Arc<dyn Fn(&Error) + Send + Sync>;
 
-/// The configured log pipeline.
+/// Value written in place of a redacted field.
+pub const REDACTED: &str = "[REDACTED]";
+
+/// The configured logging pipeline.
+///
+/// Build one with [`Logger::builder`]. A `Logger` is cheap to clone and
+/// `Send + Sync`; share it by cloning or install it process-wide with
+/// [`crate::init`].
+///
+/// # Record assembly
+///
+/// For each admitted record the logger:
+///
+/// 1. stamps the wall-clock time (unless disabled);
+/// 2. collects ambient fields: default fields, then the thread's
+///    context ([`crate::context`]), then any extra context supplied by
+///    an integration (for example `tracing` span fields);
+/// 3. removes duplicate keys so every key appears once. Precedence is
+///    call-site fields > extra context > thread context > defaults;
+/// 4. replaces the values of redacted keys with [`REDACTED`];
+/// 5. hands the record to every sink in installation order. A failing
+///    sink does not stop the others; each failure goes to the error
+///    handler;
+/// 6. flushes every sink if the record is at or above the flush level
+///    (default [`Level::Error`]).
+///
+/// Steps 2-4 use stack buffers for up to 16 fields per group and do not
+/// allocate in that case.
+///
+/// # Shutdown
+///
+/// When the last clone is dropped, every sink is shut down (flushed,
+/// background threads drained and joined) and failures are reported
+/// to the error handler. A logger stored in a `static` is never
+/// dropped: keep the [`crate::FlushGuard`] from [`crate::init`] or
+/// [`Logger::flush_guard`] alive, or call [`Logger::shutdown`].
+///
+/// # Examples
+///
+/// ```
+/// use log_io::{Field, Level, Logger};
+///
+/// let logger = Logger::builder()
+///     .level(Level::Info)
+///     .with_default_field("service", "billing")
+///     .stdout_json()
+///     .build();
+///
+/// logger.log(Level::Info, "ready", &[Field::new("port", 8443_u16)]);
+/// log_io::warn!(logger, "slow query took {} ms", 1280, table = "invoices");
+/// ```
 #[derive(Clone)]
 pub struct Logger {
     inner: Arc<LoggerInner>,
 }
 
-struct LoggerInner {
-    filter: Filter,
-    sinks: Box<[Arc<dyn Sink>]>,
-    default_fields: Box<[OwnedField]>,
-    capture_timestamps: bool,
-    capture_context: bool,
-    on_error: Option<ErrorHandler>,
+// `Logger` keeps working after a panic anywhere in the pipeline: sink
+// locks recover from poisoning and no logger state is left half-updated
+// by an unwind, so observing it after `catch_unwind` is sound.
+impl std::panic::UnwindSafe for Logger {}
+impl std::panic::RefUnwindSafe for Logger {}
+
+pub(crate) struct LoggerInner {
+    pub(crate) filter: Filter,
+    pub(crate) sinks: Box<[Box<dyn Sink>]>,
+    pub(crate) defaults: Box<[OwnedField]>,
+    pub(crate) default_target: Box<str>,
+    pub(crate) capture_timestamps: bool,
+    pub(crate) capture_context: bool,
+    pub(crate) flush_level: Level,
+    pub(crate) on_error: Option<ErrorHandler>,
+    /// Lower-cased keys whose values are replaced by [`REDACTED`].
+    pub(crate) redact: Box<[Box<str>]>,
+}
+
+impl Drop for LoggerInner {
+    fn drop(&mut self) {
+        for sink in &self.sinks {
+            if let Err(e) = sink.shutdown() {
+                report_with(self.on_error.as_ref(), &e);
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// Depth of `dispatch` calls on this thread. Read by the panic
+    /// hook so it never re-enters a sink that the panicking frame may
+    /// still hold locked.
+    static DISPATCH_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// Set while an error handler runs on this thread.
+    static IN_HANDLER: Cell<bool> = const { Cell::new(false) };
+    /// Reusable buffer for rendering `format_args!` messages.
+    static MESSAGE_BUF: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// `true` while this thread is inside a logger dispatch (a sink or
+/// format is running).
+pub(crate) fn in_dispatch() -> bool {
+    DISPATCH_DEPTH.try_with(Cell::get).unwrap_or(0) > 0
+}
+
+struct DepthGuard;
+
+impl DepthGuard {
+    fn enter() -> Self {
+        let _tls_may_be_gone = DISPATCH_DEPTH.try_with(|d| d.set(d.get().saturating_add(1)));
+        Self
+    }
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        let _tls_may_be_gone = DISPATCH_DEPTH.try_with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+fn report_with(handler: Option<&ErrorHandler>, error: &Error) {
+    let Some(handler) = handler else {
+        return;
+    };
+    let _tls_may_be_gone = IN_HANDLER.try_with(|busy| {
+        if busy.get() {
+            return;
+        }
+        busy.set(true);
+        struct Reset<'a>(&'a Cell<bool>);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let _reset = Reset(busy);
+        handler(error);
+    });
 }
 
 impl Logger {
-    /// Start configuring a logger.
-    #[must_use]
+    /// Start configuring a logger. See [`LoggerBuilder`] for defaults.
     pub fn builder() -> LoggerBuilder {
-        LoggerBuilder {
-            filter: Filter::new(Level::Info),
-            sinks: Vec::new(),
-            default_fields: Vec::new(),
-            capture_timestamps: true,
-            capture_context: true,
-            on_error: None,
+        LoggerBuilder::new()
+    }
+
+    pub(crate) fn from_inner(inner: LoggerInner) -> Self {
+        Self {
+            inner: Arc::new(inner),
         }
     }
 
-    /// The configured filter threshold for `target`.
+    /// The filter threshold that applies to `target`.
     #[must_use]
     pub fn threshold_for(&self, target: &str) -> Level {
         self.inner.filter.threshold_for(target)
     }
 
-    /// Returns `true` if a record with this severity and target would
-    /// pass the filter. Use in hot paths to skip field construction
-    /// before [`Self::log`].
+    /// Returns `true` if a record with this target and level would pass
+    /// the filter. The macros call this before evaluating any field or
+    /// formatting the message.
+    #[inline]
     #[must_use]
     pub fn enabled(&self, target: &str, level: Level) -> bool {
         self.inner.filter.is_enabled(target, level)
     }
 
-    /// The lowest severity the filter admits anywhere. Useful for
-    /// short-circuiting macros at the call site.
+    /// The lowest severity the filter admits for any target. A record
+    /// below it is rejected without looking at its target.
     #[must_use]
     pub fn min_level(&self) -> Level {
-        let mut min = self.inner.filter.default_level();
-        for rule in self.inner.filter.rules() {
-            if rule.level < min {
-                min = rule.level;
-            }
-        }
-        min
+        self.inner.filter.min_level()
     }
 
-    /// Emit a record using the empty string as the target. The
-    /// simplest entry point; macros prefer [`Self::try_emit`] so they
-    /// can attach source location.
-    pub fn log(&self, level: Level, message: &str, fields: &[Field<'_>]) {
-        let _ = self.try_log(level, "", message, fields);
+    /// The filter in use.
+    #[must_use]
+    pub fn filter(&self) -> &Filter {
+        &self.inner.filter
     }
 
-    /// Emit a record at `level` with explicit `target`.
+    /// Number of installed sinks.
+    #[must_use]
+    pub fn sink_count(&self) -> usize {
+        self.inner.sinks.len()
+    }
+
+    /// The target used by [`Logger::log`] (empty unless set with
+    /// [`LoggerBuilder::default_target`]).
+    #[must_use]
+    pub fn default_target(&self) -> &str {
+        &self.inner.default_target
+    }
+
+    /// Emit a record with the logger's default target.
     ///
-    /// Sink errors are passed to the configured error handler (if any)
-    /// and then returned. Use [`Self::log`] for fire-and-forget calls.
+    /// Errors are passed to the error handler, not returned. Note that
+    /// per-target filter rules only apply to this record if they match
+    /// the default target; the macros use the calling module's path
+    /// instead.
+    pub fn log(&self, level: Level, message: &str, fields: &[Field<'_>]) {
+        let _reported_to_handler = self.try_log(level, &self.inner.default_target, message, fields);
+    }
+
+    /// Emit a record with an explicit target.
     ///
     /// # Errors
     ///
-    /// Returns the first sink error; remaining sinks still receive the
-    /// record so a transient failure on one destination does not
-    /// starve the others.
+    /// Returns the first sink or flush error. Every sink still receives
+    /// the record, and every error is also passed to the error handler.
     pub fn try_log(
         &self,
         level: Level,
@@ -150,368 +253,328 @@ impl Logger {
         message: &str,
         fields: &[Field<'_>],
     ) -> Result<()> {
-        let metadata = Metadata::new(level, target);
-        self.try_emit(metadata, message, fields)
+        self.try_emit(Metadata::new(level, target), message, fields)
     }
 
-    /// Lowest-level emission entry point. Accepts a fully-constructed
-    /// [`Metadata`] so the caller (typically a macro) can attach
-    /// source location.
-    ///
-    /// The logger augments the metadata with a timestamp (if enabled)
-    /// before dispatch. Filtering uses `metadata.target` and
-    /// `metadata.level`.
+    /// Lowest-level entry point: emit a record with caller-supplied
+    /// metadata (for example a source location). The filter uses
+    /// `metadata.target` and `metadata.level`; a timestamp is added if
+    /// timestamps are enabled and `metadata` has none.
     ///
     /// # Errors
     ///
-    /// Returns the first sink error encountered. Other sinks are still
-    /// attempted; see the type-level docs on dispatch semantics.
+    /// Same as [`Logger::try_log`].
     pub fn try_emit(
-        &self,
-        mut metadata: Metadata<'_>,
-        message: &str,
-        fields: &[Field<'_>],
-    ) -> Result<()> {
-        if !self
-            .inner
-            .filter
-            .is_enabled(metadata.target, metadata.level)
-        {
-            return Ok(());
-        }
-        if self.inner.capture_timestamps && metadata.timestamp_unix_nanos.is_none() {
-            metadata = metadata.with_timestamp(time::now_unix_nanos());
-        }
-
-        let result = if self.inner.capture_context {
-            context::with_snapshot(|ctx_fields| {
-                self.dispatch_with_context(metadata, message, fields, ctx_fields)
-            })
-        } else {
-            self.dispatch_with_context(metadata, message, fields, &[])
-        };
-
-        if let Err(ref e) = result {
-            if let Some(handler) = &self.inner.on_error {
-                handler(e);
-            }
-        }
-        result
-    }
-
-    /// Flush every configured sink. Use during graceful shutdown to
-    /// drain buffered output.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first flush error. Other sinks are still flushed.
-    pub fn flush(&self) -> Result<()> {
-        let mut first_err: Option<crate::error::Error> = None;
-        for sink in self.inner.sinks.iter() {
-            if let Err(e) = sink.flush() {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
-            }
-        }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-    }
-
-    /// Number of installed sinks. Useful for assertions in tests and
-    /// for logging the logger's own configuration.
-    #[must_use]
-    pub fn sink_count(&self) -> usize {
-        self.inner.sinks.len()
-    }
-
-    fn dispatch_with_context(
         &self,
         metadata: Metadata<'_>,
         message: &str,
         fields: &[Field<'_>],
-        ctx_fields: &[Field<'_>],
     ) -> Result<()> {
-        // Merge logger-default fields, thread-local context, and call
-        // fields into the record's `context` slot. Per-call fields go
-        // in `fields` so formatters can still distinguish them.
-        //
-        // Materialize default fields onto the stack via a small inline
-        // buffer; on overflow fall back to a Vec.
-        if self.inner.default_fields.is_empty() {
-            let record = Record::with_context(metadata, message, fields, ctx_fields);
-            return self.dispatch(&record);
+        if !self.enabled(metadata.target, metadata.level) {
+            return Ok(());
         }
-
-        // Stack buffer large enough for typical cases.
-        const STACK: usize = 16;
-        let total = self.inner.default_fields.len() + ctx_fields.len();
-        if total <= STACK {
-            let mut buf: [Field<'_>; STACK] = [Field {
-                key: "",
-                value: Value::Null,
-            }; STACK];
-            let mut n = 0;
-            for f in self.inner.default_fields.iter() {
-                buf[n] = Field::new(f.key.as_str(), f.value.as_value());
-                n += 1;
-            }
-            for f in ctx_fields {
-                buf[n] = *f;
-                n += 1;
-            }
-            let record = Record::with_context(metadata, message, fields, &buf[..n]);
-            self.dispatch(&record)
-        } else {
-            let mut merged: Vec<Field<'_>> = Vec::with_capacity(total);
-            for f in self.inner.default_fields.iter() {
-                merged.push(Field::new(f.key.as_str(), f.value.as_value()));
-            }
-            merged.extend_from_slice(ctx_fields);
-            let record = Record::with_context(metadata, message, fields, &merged);
-            self.dispatch(&record)
-        }
+        self.emit_unchecked(metadata, message, fields, &[])
     }
 
-    fn dispatch(&self, record: &Record<'_>) -> Result<()> {
-        let mut first_err: Option<crate::error::Error> = None;
-        for sink in self.inner.sinks.iter() {
-            if let Err(e) = sink.write_record(record) {
-                if first_err.is_none() {
-                    first_err = Some(e);
+    /// Flush every sink. Records at or above the flush level are already
+    /// flushed as they are written; call this before a planned exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error. Every sink is still flushed, and every
+    /// error is also passed to the error handler.
+    pub fn flush(&self) -> Result<()> {
+        self.for_each_sink(|sink| sink.flush())
+    }
+
+    /// Flush every sink and stop background workers, draining their
+    /// queues first. The logger stays usable afterwards: sinks with a
+    /// background thread write later records synchronously.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Logger::flush`].
+    pub fn shutdown(&self) -> Result<()> {
+        self.for_each_sink(|sink| sink.shutdown())
+    }
+
+    /// A guard that calls [`Logger::shutdown`] when dropped. Keep it
+    /// alive in `main` when the logger outlives `main` (for example in
+    /// a `static`).
+    pub fn flush_guard(&self) -> crate::FlushGuard {
+        crate::FlushGuard::new(self.clone())
+    }
+
+    fn for_each_sink(&self, op: impl Fn(&dyn Sink) -> Result<()>) -> Result<()> {
+        let _depth = DepthGuard::enter();
+        let mut first = None;
+        for sink in &self.inner.sinks {
+            if let Err(e) = op(&**sink) {
+                self.report(&e);
+                if first.is_none() {
+                    first = Some(e);
                 }
             }
         }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
+        first.map_or(Ok(()), Err)
+    }
+
+    pub(crate) fn report(&self, error: &Error) {
+        report_with(self.inner.on_error.as_ref(), error);
+    }
+
+    /// Emit a message given as format arguments, without re-checking
+    /// the filter. Renders into a reused thread-local buffer, so it
+    /// does not allocate in steady state; a literal with no arguments
+    /// is used as-is.
+    pub(crate) fn emit_fmt(
+        &self,
+        metadata: Metadata<'_>,
+        args: fmt::Arguments<'_>,
+        fields: &[Field<'_>],
+        extra: &[Field<'_>],
+    ) {
+        if let Some(message) = args.as_str() {
+            let _reported = self.emit_unchecked(metadata, message, fields, extra);
+            return;
         }
+        let pooled = MESSAGE_BUF.try_with(|cell| {
+            let mut buf = cell.try_borrow_mut().ok()?;
+            self.emit_rendered(&mut buf, metadata, args, fields, extra);
+            trim_buffer(&mut buf);
+            Some(())
+        });
+        if !matches!(pooled, Ok(Some(()))) {
+            // Reentrant call from inside a sink, or thread teardown.
+            self.emit_rendered(&mut String::new(), metadata, args, fields, extra);
+        }
+    }
+
+    fn emit_rendered(
+        &self,
+        buf: &mut String,
+        metadata: Metadata<'_>,
+        args: fmt::Arguments<'_>,
+        fields: &[Field<'_>],
+        extra: &[Field<'_>],
+    ) {
+        buf.clear();
+        let rendered = fmt::write(buf, args);
+        let _reported = self.emit_unchecked(metadata, buf, fields, extra);
+        if rendered.is_err() {
+            // A `Display` impl in the arguments failed; the record was
+            // emitted with whatever text was produced before the error.
+            self.report(&Error::Format(fmt::Error));
+        }
+    }
+
+    /// Assemble and dispatch without consulting the filter. `extra` is
+    /// ambient context supplied by an integration; it shadows thread
+    /// context and defaults.
+    pub(crate) fn emit_unchecked(
+        &self,
+        mut metadata: Metadata<'_>,
+        message: &str,
+        fields: &[Field<'_>],
+        extra: &[Field<'_>],
+    ) -> Result<()> {
+        if self.inner.capture_timestamps && metadata.timestamp_unix_nanos.is_none() {
+            metadata.timestamp_unix_nanos = Some(time::now_unix_nanos());
+        }
+        if self.inner.capture_context {
+            context::with_snapshot(|ctx| self.assemble(metadata, message, fields, ctx, extra))
+        } else {
+            self.assemble(metadata, message, fields, &[], extra)
+        }
+    }
+
+    fn assemble(
+        &self,
+        metadata: Metadata<'_>,
+        message: &str,
+        fields: &[Field<'_>],
+        ctx: &[Field<'_>],
+        extra: &[Field<'_>],
+    ) -> Result<()> {
+        let defaults = &self.inner.defaults;
+        let redacting = !self.inner.redact.is_empty();
+        if defaults.is_empty()
+            && extra.is_empty()
+            && !redacting
+            && (ctx.is_empty() || !any_key_in(ctx, fields))
+        {
+            return self.dispatch(&Record::with_context(metadata, message, fields, ctx));
+        }
+
+        let mut call = FieldBuf::new();
+        let fields = if redacting && fields.iter().any(|f| self.is_redacted(f.key)) {
+            for f in fields {
+                call.push(self.redacted(*f));
+            }
+            call.as_slice()
+        } else {
+            fields
+        };
+
+        // Highest precedence first; each layer newest first. Reversed
+        // at the end so the output keeps defaults, context, extra order.
+        let mut ambient = FieldBuf::new();
+        let layers = [extra, ctx];
+        for layer in layers {
+            for f in layer.iter().rev() {
+                self.push_ambient(&mut ambient, *f, fields);
+            }
+        }
+        for owned in defaults.iter().rev() {
+            self.push_ambient(&mut ambient, owned.as_field(), fields);
+        }
+        ambient.reverse();
+        self.dispatch(&Record::with_context(
+            metadata,
+            message,
+            fields,
+            ambient.as_slice(),
+        ))
+    }
+
+    #[inline]
+    fn push_ambient<'a>(&self, ambient: &mut FieldBuf<'a>, field: Field<'a>, call: &[Field<'_>]) {
+        let shadowed = call.iter().any(|c| c.key == field.key)
+            || ambient.as_slice().iter().any(|a| a.key == field.key);
+        if !shadowed {
+            ambient.push(self.redacted(field));
+        }
+    }
+
+    #[inline]
+    fn redacted<'a>(&self, field: Field<'a>) -> Field<'a> {
+        if self.is_redacted(field.key) {
+            Field {
+                key: field.key,
+                value: Value::Str(REDACTED),
+            }
+        } else {
+            field
+        }
+    }
+
+    /// A key is redacted when it, or its last dot-separated segment,
+    /// equals a configured key (ASCII case-insensitive).
+    fn is_redacted(&self, key: &str) -> bool {
+        if self.inner.redact.is_empty() {
+            return false;
+        }
+        let last = key.rsplit('.').next().unwrap_or(key);
+        self.inner
+            .redact
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(key) || r.eq_ignore_ascii_case(last))
+    }
+
+    fn dispatch(&self, record: &Record<'_>) -> Result<()> {
+        let _depth = DepthGuard::enter();
+        let mut first = None;
+        for sink in &self.inner.sinks {
+            if let Err(e) = sink.write_record(record) {
+                self.report(&e);
+                if first.is_none() {
+                    first = Some(e);
+                }
+            }
+        }
+        if record.metadata.level >= self.inner.flush_level {
+            for sink in &self.inner.sinks {
+                if let Err(e) = sink.flush() {
+                    self.report(&e);
+                    if first.is_none() {
+                        first = Some(e);
+                    }
+                }
+            }
+        }
+        first.map_or(Ok(()), Err)
     }
 }
 
-impl core::fmt::Debug for Logger {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+fn any_key_in(a: &[Field<'_>], b: &[Field<'_>]) -> bool {
+    !b.is_empty() && a.iter().any(|x| b.iter().any(|y| x.key == y.key))
+}
+
+impl fmt::Debug for Logger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Logger")
             .field("filter", &self.inner.filter)
             .field("sinks", &self.inner.sinks.len())
-            .field("default_fields", &self.inner.default_fields.len())
+            .field("default_fields", &self.inner.defaults.len())
+            .field("default_target", &self.inner.default_target)
             .field("capture_timestamps", &self.inner.capture_timestamps)
             .field("capture_context", &self.inner.capture_context)
-            .finish()
+            .field("flush_level", &self.inner.flush_level)
+            .field("redacted_keys", &self.inner.redact.len())
+            .finish_non_exhaustive()
     }
 }
 
-/// Builder for [`Logger`]. Construct with [`Logger::builder`].
-///
-/// The builder is not generic over a format. Each call that installs
-/// a sink ([`Self::with_sink`], [`Self::stdout`], [`Self::stderr`],
-/// [`Self::writer`], or one of the format-specific shortcuts) carries
-/// its own format.
-pub struct LoggerBuilder {
-    filter: Filter,
-    sinks: Vec<Arc<dyn Sink>>,
-    default_fields: Vec<OwnedField>,
-    capture_timestamps: bool,
-    capture_context: bool,
-    on_error: Option<ErrorHandler>,
+/// Up to 16 fields on the stack, spilling to the heap beyond that.
+struct FieldBuf<'a> {
+    stack: [Field<'a>; 16],
+    len: usize,
+    heap: Vec<Field<'a>>,
 }
 
-impl LoggerBuilder {
-    /// Set the default minimum severity.
-    #[must_use]
-    pub fn level(mut self, level: Level) -> Self {
-        let prior_rules = self.filter.rules().to_vec();
-        self.filter = Filter::new(level);
-        for rule in prior_rules {
-            self.filter = self.filter.with_rule(rule.target, rule.level);
+impl<'a> FieldBuf<'a> {
+    const EMPTY: Field<'static> = Field {
+        key: "",
+        value: Value::Null,
+    };
+
+    fn new() -> Self {
+        Self {
+            stack: [Self::EMPTY; 16],
+            len: 0,
+            heap: Vec::new(),
         }
-        self
     }
 
-    /// Replace the filter wholesale.
-    #[must_use]
-    pub fn filter(mut self, filter: Filter) -> Self {
-        self.filter = filter;
-        self
-    }
-
-    /// Add a per-target filter override. See [`Filter::with_rule`].
-    #[must_use]
-    pub fn target_level(mut self, target: impl Into<String>, level: Level) -> Self {
-        self.filter = self.filter.with_rule(target, level);
-        self
-    }
-
-    /// Parse `directive` and replace the filter. Silently retains the
-    /// previous filter on parse error; use [`Filter::parse`] up front
-    /// if you need to surface the error.
-    #[must_use]
-    pub fn filter_directive(mut self, directive: &str) -> Self {
-        if let Ok(f) = Filter::parse(directive) {
-            self.filter = f;
+    #[inline]
+    fn push(&mut self, field: Field<'a>) {
+        if !self.heap.is_empty() {
+            self.heap.push(field);
+        } else if let Some(slot) = self.stack.get_mut(self.len) {
+            *slot = field;
+            self.len += 1;
+        } else {
+            self.heap.reserve(self.len * 2);
+            self.heap.extend_from_slice(&self.stack[..self.len]);
+            self.heap.push(field);
         }
-        self
     }
 
-    /// Disable timestamp capture. By default the logger records a
-    /// timestamp on every record using [`std::time::SystemTime`].
-    #[must_use]
-    pub fn no_timestamps(mut self) -> Self {
-        self.capture_timestamps = false;
-        self
+    #[inline]
+    fn as_slice(&self) -> &[Field<'a>] {
+        if self.heap.is_empty() {
+            &self.stack[..self.len]
+        } else {
+            &self.heap
+        }
     }
 
-    /// Disable thread-local context capture.
-    #[must_use]
-    pub fn no_context(mut self) -> Self {
-        self.capture_context = false;
-        self
-    }
-
-    /// Attach a field that the logger emits on every record. Useful
-    /// for service-level identifiers like `service_name` or `version`.
-    #[must_use]
-    pub fn with_default_field<'a, V: Into<Value<'a>>>(
-        mut self,
-        key: impl Into<String>,
-        value: V,
-    ) -> Self {
-        self.default_fields.push(OwnedField {
-            key: key.into(),
-            value: OwnedValue::from_value(value.into()),
-        });
-        self
-    }
-
-    /// Install a callback invoked when a sink returns an error.
-    #[must_use]
-    pub fn on_error(mut self, handler: ErrorHandler) -> Self {
-        self.on_error = Some(handler);
-        self
-    }
-
-    /// Install a sink directly. Use this when you have a pre-built
-    /// sink (typical for [`crate::sink::FileSink`] which is fallible
-    /// to open).
-    #[must_use]
-    pub fn with_sink(mut self, sink: impl Sink + 'static) -> Self {
-        self.sinks.push(Arc::new(sink));
-        self
-    }
-
-    /// Install a stdout sink with the given format.
-    #[must_use]
-    pub fn stdout<F>(mut self, format: F) -> Self
-    where
-        F: Format + Send + Sync + 'static,
-    {
-        self.sinks.push(Arc::new(StdoutSink::new(format)));
-        self
-    }
-
-    /// Install a stderr sink with the given format.
-    #[must_use]
-    pub fn stderr<F>(mut self, format: F) -> Self
-    where
-        F: Format + Send + Sync + 'static,
-    {
-        self.sinks.push(Arc::new(StderrSink::new(format)));
-        self
-    }
-
-    /// Install a sink that writes to `writer` with `format`.
-    #[must_use]
-    pub fn writer<W, F>(mut self, writer: W, format: F) -> Self
-    where
-        W: Write + Send + 'static,
-        F: Format + Send + Sync + 'static,
-    {
-        self.sinks.push(Arc::new(WriterSink::new(writer, format)));
-        self
-    }
-
-    /// Finish configuration. Panics if no sink has been installed.
-    ///
-    /// # Panics
-    ///
-    /// Panics if [`Self::with_sink`], [`Self::stdout`], [`Self::stderr`],
-    /// [`Self::writer`], or one of the format shortcuts has not been
-    /// called. Building a logger without a destination is almost
-    /// certainly a programmer error.
-    #[must_use]
-    pub fn build(self) -> Logger {
-        assert!(
-            !self.sinks.is_empty(),
-            "log_io: builder must install at least one sink before build()"
-        );
-        Logger {
-            inner: Arc::new(LoggerInner {
-                filter: self.filter,
-                sinks: self.sinks.into_boxed_slice(),
-                default_fields: self.default_fields.into_boxed_slice(),
-                capture_timestamps: self.capture_timestamps,
-                capture_context: self.capture_context,
-                on_error: self.on_error,
-            }),
+    fn reverse(&mut self) {
+        if self.heap.is_empty() {
+            self.stack[..self.len].reverse();
+        } else {
+            self.heap.reverse();
         }
     }
 }
 
-// Format-shortcut methods. These are feature-gated and produce the
-// most common (stdout, stderr) sinks pre-wired to a built-in format.
-
-#[cfg(feature = "json")]
-impl LoggerBuilder {
-    /// Install a stdout sink with the default JSON format.
-    #[must_use]
-    pub fn stdout_json(self) -> Self {
-        self.stdout(crate::format::JsonFormat::new())
-    }
-
-    /// Install a stderr sink with the default JSON format.
-    #[must_use]
-    pub fn stderr_json(self) -> Self {
-        self.stderr(crate::format::JsonFormat::new())
-    }
-}
-
-#[cfg(feature = "logfmt")]
-impl LoggerBuilder {
-    /// Install a stdout sink with the logfmt format.
-    #[must_use]
-    pub fn stdout_logfmt(self) -> Self {
-        self.stdout(crate::format::LogfmtFormat::new())
-    }
-
-    /// Install a stderr sink with the logfmt format.
-    #[must_use]
-    pub fn stderr_logfmt(self) -> Self {
-        self.stderr(crate::format::LogfmtFormat::new())
-    }
-}
-
-#[cfg(feature = "human")]
-impl LoggerBuilder {
-    /// Install a stdout sink with the human-readable format.
-    #[must_use]
-    pub fn stdout_human(self) -> Self {
-        self.stdout(crate::format::HumanFormat::new())
-    }
-
-    /// Install a stderr sink with the human-readable format.
-    #[must_use]
-    pub fn stderr_human(self) -> Self {
-        self.stderr(crate::format::HumanFormat::new())
-    }
-}
-
-#[cfg(all(test, feature = "std", feature = "logfmt", feature = "json"))]
+#[cfg(all(test, feature = "logfmt", feature = "json"))]
 mod tests {
     use super::*;
+    use crate::format::{JsonFormat, LogfmtFormat};
     use std::io::Write;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Default, Clone)]
     struct MemBuf(Arc<Mutex<Vec<u8>>>);
@@ -526,150 +589,402 @@ mod tests {
         }
     }
 
-    fn logfmt_logger() -> (Logger, MemBuf) {
-        let buf = MemBuf::default();
-        let logger = Logger::builder()
+    impl MemBuf {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    fn quiet() -> LoggerBuilder {
+        Logger::builder()
             .level(Level::Trace)
             .no_timestamps()
             .no_context()
-            .writer(buf.clone(), crate::format::LogfmtFormat::new())
-            .build();
-        (logger, buf)
+    }
+
+    struct Failing(AtomicUsize);
+    impl Sink for Failing {
+        fn write_record(&self, _record: &Record<'_>) -> Result<()> {
+            let _n = self.0.fetch_add(1, Ordering::Relaxed);
+            Err(Error::Configuration("boom"))
+        }
+        fn flush(&self) -> Result<()> {
+            Err(Error::Configuration("flush boom"))
+        }
     }
 
     #[test]
-    fn enabled_respects_filter() {
-        let (logger, _) = logfmt_logger();
-        assert!(logger.enabled("x", Level::Trace));
-        assert!(logger.enabled("x", Level::Error));
-    }
-
-    #[test]
-    fn min_level_is_lowest_configured() {
+    fn test_logger_enabled_and_min_level() {
         let logger = Logger::builder()
             .level(Level::Warn)
             .target_level("loud", Level::Trace)
-            .no_timestamps()
-            .no_context()
             .with_sink(crate::sink::NullSink::new())
             .build();
+        assert!(logger.enabled("loud", Level::Trace));
+        assert!(!logger.enabled("other", Level::Info));
         assert_eq!(logger.min_level(), Level::Trace);
+        assert_eq!(logger.threshold_for("loud::x"), Level::Trace);
+        assert_eq!(logger.filter().default_level(), Level::Warn);
+        assert_eq!(logger.sink_count(), 1);
     }
 
     #[test]
-    fn log_writes_through_logfmt() {
-        let (logger, buf) = logfmt_logger();
+    fn test_logger_log_writes_through_logfmt() {
+        let buf = MemBuf::default();
+        let logger = quiet().writer(buf.clone(), LogfmtFormat::new()).build();
         logger.log(Level::Info, "hi", &[Field::new("k", 1_u64)]);
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        assert!(out.contains("level=info"));
-        assert!(out.contains("message=hi"));
-        assert!(out.contains("k=1"));
+        assert_eq!(buf.text(), "level=info target=\"\" message=hi k=1\n");
     }
 
     #[test]
-    fn filter_blocks_records_below_threshold() {
+    fn test_logger_default_target_is_used_by_log() {
+        // The audit's R11: `log` with a per-target filter.
         let buf = MemBuf::default();
         let logger = Logger::builder()
-            .level(Level::Warn)
+            .filter_directive("myapp=debug")
+            .default_target("myapp")
             .no_timestamps()
-            .no_context()
-            .writer(buf.clone(), crate::format::LogfmtFormat::new())
+            .writer(buf.clone(), JsonFormat::new())
             .build();
-        logger.log(Level::Info, "skip", &[]);
-        logger.log(Level::Error, "keep", &[]);
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        assert!(!out.contains("skip"));
-        assert!(out.contains("keep"));
+        assert_eq!(logger.default_target(), "myapp");
+        logger.log(Level::Error, "kept", &[]);
+        assert!(
+            buf.text().contains("\"target\":\"myapp\""),
+            "{}",
+            buf.text()
+        );
     }
 
     #[test]
-    fn context_is_spliced_in() {
+    fn test_logger_context_is_spliced_in() {
         let buf = MemBuf::default();
         let logger = Logger::builder()
             .level(Level::Trace)
             .no_timestamps()
-            .writer(buf.clone(), crate::format::LogfmtFormat::new())
+            .writer(buf.clone(), LogfmtFormat::new())
             .build();
-        crate::context::clear();
-        let guard = crate::context::with_trace_id("tx-42");
+        context::clear();
+        let guard = context::with_trace_id("tx-42");
         logger.log(Level::Info, "hello", &[]);
         drop(guard);
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        assert!(out.contains("trace_id=tx-42"), "{out}");
+        assert!(buf.text().contains("trace_id=tx-42"), "{}", buf.text());
     }
 
     #[test]
-    fn default_fields_appear_on_every_record() {
+    fn test_logger_duplicate_keys_follow_precedence() {
+        // The audit's R06: defaults < context < call fields, one key each.
+        context::clear();
         let buf = MemBuf::default();
         let logger = Logger::builder()
             .level(Level::Trace)
             .no_timestamps()
-            .no_context()
+            .with_default_field("user", "default")
             .with_default_field("service", "api")
-            .with_default_field("region", "us-east-1")
-            .writer(buf.clone(), crate::format::LogfmtFormat::new())
+            .with_default_field("region", "eu")
+            .writer(buf.clone(), JsonFormat::new())
             .build();
-        logger.log(Level::Info, "x", &[]);
-        logger.log(Level::Warn, "y", &[Field::new("port", 80_u32)]);
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        assert_eq!(out.matches("service=api").count(), 2);
-        assert_eq!(out.matches("region=us-east-1").count(), 2);
-        assert!(out.contains("port=80"));
+        let _a = context::with_field("user", "outer");
+        let _b = context::with_field("user", "inner");
+        let _c = context::with_field("region", "us");
+        logger.log(Level::Error, "m", &[Field::new("region", "call")]);
+        let out = buf.text();
+        assert_eq!(
+            out,
+            "{\"level\":\"error\",\"target\":\"\",\"message\":\"m\",\"service\":\"api\",\
+             \"user\":\"inner\",\"region\":\"call\"}\n"
+        );
+        context::clear();
     }
 
     #[test]
-    fn dispatch_continues_after_sink_error() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        struct FailingSink(AtomicUsize);
-        impl Sink for FailingSink {
-            fn write_record(&self, _record: &Record<'_>) -> Result<()> {
-                self.0.fetch_add(1, Ordering::Relaxed);
-                Err(crate::error::Error::Configuration("boom"))
+    fn test_logger_context_vs_call_dedup_without_defaults() {
+        context::clear();
+        let buf = MemBuf::default();
+        let logger = Logger::builder()
+            .level(Level::Trace)
+            .no_timestamps()
+            .writer(buf.clone(), LogfmtFormat::new())
+            .build();
+        let _t = context::with_field("tenant", "ctx");
+        logger.log(Level::Info, "m", &[Field::new("tenant", "call")]);
+        assert_eq!(buf.text(), "level=info target=\"\" message=m tenant=call\n");
+        context::clear();
+    }
+
+    #[test]
+    fn test_logger_extra_context_shadows_thread_context() {
+        context::clear();
+        let buf = MemBuf::default();
+        let logger = Logger::builder()
+            .level(Level::Trace)
+            .no_timestamps()
+            .writer(buf.clone(), LogfmtFormat::new())
+            .build();
+        let _t = context::with_field("span", "thread");
+        let extra = [Field::new("span", "extra"), Field::new("depth", 2_u8)];
+        logger.emit_fmt(
+            Metadata::new(Level::Info, "t"),
+            format_args!("m"),
+            &[],
+            &extra,
+        );
+        assert_eq!(
+            buf.text(),
+            "level=info target=t message=m span=extra depth=2\n"
+        );
+        context::clear();
+    }
+
+    #[test]
+    fn test_logger_redacts_keys_everywhere() {
+        context::clear();
+        let buf = MemBuf::default();
+        let logger = Logger::builder()
+            .level(Level::Trace)
+            .no_timestamps()
+            .redact_common_secrets()
+            .redact_key("Session_ID")
+            .with_default_field("api_key", "k-123")
+            .writer(buf.clone(), LogfmtFormat::new())
+            .build();
+        let _c = context::with_field("authorization", "Bearer x");
+        logger.log(
+            Level::Info,
+            "login",
+            &[
+                Field::new("user", "alice"),
+                Field::new("db.PASSWORD", "hunter2"),
+                Field::new("session_id", "s1"),
+            ],
+        );
+        let out = buf.text();
+        for secret in ["k-123", "Bearer", "hunter2", "s1"] {
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        }
+        assert!(out.contains("user=alice"), "{out}");
+        assert_eq!(out.matches(REDACTED).count(), 4, "{out}");
+        context::clear();
+    }
+
+    #[test]
+    fn test_logger_redaction_never_evaluates_lazy_values() {
+        struct Explodes;
+        impl fmt::Display for Explodes {
+            fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+                Err(fmt::Error)
+            }
+        }
+        let buf = MemBuf::default();
+        let logger = quiet()
+            .redact_key("token")
+            .writer(buf.clone(), JsonFormat::new())
+            .build();
+        let result = logger.try_log(
+            Level::Info,
+            "t",
+            "m",
+            &[Field::new("token", Value::Display(&Explodes))],
+        );
+        assert!(result.is_ok());
+        assert!(buf.text().contains("\"token\":\"[REDACTED]\""));
+    }
+
+    #[test]
+    fn test_logger_more_than_sixteen_ambient_fields_spill_correctly() {
+        context::clear();
+        let buf = MemBuf::default();
+        let mut builder = Logger::builder().level(Level::Trace).no_timestamps();
+        let keys: Vec<String> = (0..20).map(|i| format!("d{i}")).collect();
+        for (i, k) in keys.iter().enumerate() {
+            builder = builder.with_default_field(k.clone(), i as u32);
+        }
+        let logger = builder.writer(buf.clone(), JsonFormat::new()).build();
+        let _c = context::with_field("c", 1_u8);
+        logger.log(Level::Info, "ok", &[Field::new("d0", "call")]);
+        let out = buf.text();
+        assert!(out.contains("\"d0\":\"call\""), "{out}");
+        assert_eq!(out.matches("\"d0\"").count(), 1, "{out}");
+        for (i, k) in keys.iter().enumerate().skip(1) {
+            assert!(out.contains(&format!("\"{k}\":{i}")), "missing {k}: {out}");
+        }
+        assert!(out.contains("\"c\":1"));
+        context::clear();
+    }
+
+    #[test]
+    fn test_logger_dispatch_continues_after_sink_error_and_reports_each() {
+        // The audit's R09: the handler sees every failing sink.
+        let failing = Arc::new(Failing(AtomicUsize::new(0)));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = Arc::clone(&calls);
+        let buf = MemBuf::default();
+        let logger = quiet()
+            .flush_on(Level::Off)
+            .with_sink(Arc::clone(&failing))
+            .with_sink(Failing(AtomicUsize::new(0)))
+            .writer(buf.clone(), JsonFormat::new())
+            .on_error(Arc::new(move |_| {
+                let _n = calls2.fetch_add(1, Ordering::Relaxed);
+            }))
+            .build();
+        let result = logger.try_log(Level::Info, "t", "m", &[]);
+        assert!(matches!(result, Err(Error::Configuration("boom"))));
+        assert!(buf.text().contains("\"message\":\"m\""));
+        assert_eq!(failing.0.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "one call per failing sink"
+        );
+    }
+
+    #[test]
+    fn test_logger_flush_on_level_flushes_and_reports() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = Arc::clone(&calls);
+        let logger = quiet()
+            .flush_on(Level::Warn)
+            .with_sink(Failing(AtomicUsize::new(0)))
+            .on_error(Arc::new(move |_| {
+                let _n = calls2.fetch_add(1, Ordering::Relaxed);
+            }))
+            .build();
+        logger.log(Level::Info, "below", &[]);
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "write error only");
+        logger.log(Level::Warn, "at", &[]);
+        assert_eq!(calls.load(Ordering::Relaxed), 3, "write and flush errors");
+        assert!(logger.flush().is_err());
+        assert!(logger.shutdown().is_err());
+    }
+
+    #[test]
+    fn test_logger_on_error_recursion_is_bounded() {
+        // The audit's LOG-015: a handler that logs through the same
+        // failing logger used to recurse until the stack overflowed.
+        use std::sync::OnceLock;
+        static SELF: OnceLock<Logger> = OnceLock::new();
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let logger = quiet()
+            .with_sink(Failing(AtomicUsize::new(0)))
+            .on_error(Arc::new(|_| {
+                let _n = CALLS.fetch_add(1, Ordering::Relaxed);
+                if let Some(l) = SELF.get() {
+                    l.log(Level::Error, "sink failed", &[]);
+                }
+            }))
+            .build();
+        assert!(SELF.set(logger).is_ok());
+        if let Some(l) = SELF.get() {
+            l.log(Level::Error, "first", &[]);
+        }
+        // write error of the outer record (1) + flush error (1); the
+        // nested record's failures are not re-reported.
+        assert_eq!(CALLS.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_logger_drop_shuts_sinks_down() {
+        struct CountShutdown(Arc<AtomicUsize>);
+        impl Sink for CountShutdown {
+            fn write_record(&self, _: &Record<'_>) -> Result<()> {
+                Ok(())
             }
             fn flush(&self) -> Result<()> {
                 Ok(())
             }
-        }
-        let failing: Arc<FailingSink> = Arc::new(FailingSink(AtomicUsize::new(0)));
-        let buf = MemBuf::default();
-        let logger = Logger::builder()
-            .level(Level::Trace)
-            .no_timestamps()
-            .no_context()
-            .with_sink(failing.clone())
-            .writer(buf.clone(), crate::format::JsonFormat::new())
-            .build();
-        let _ = logger.try_log(Level::Info, "t", "m", &[]);
-        // Second sink still wrote even though first failed.
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        assert!(out.contains("\"message\":\"m\""), "{out}");
-        assert_eq!(failing.0.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn on_error_callback_fires() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        struct Bad;
-        impl Sink for Bad {
-            fn write_record(&self, _r: &Record<'_>) -> Result<()> {
-                Err(crate::error::Error::Configuration("nope"))
-            }
-            fn flush(&self) -> Result<()> {
+            fn shutdown(&self) -> Result<()> {
+                let _n = self.0.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
         }
         let count = Arc::new(AtomicUsize::new(0));
-        let count_clone = count.clone();
-        let logger = Logger::builder()
-            .level(Level::Trace)
-            .no_timestamps()
-            .no_context()
-            .with_sink(Bad)
-            .on_error(Arc::new(move |_| {
-                count_clone.fetch_add(1, Ordering::Relaxed);
+        let logger = quiet().with_sink(CountShutdown(Arc::clone(&count))).build();
+        let clone = logger.clone();
+        drop(logger);
+        assert_eq!(count.load(Ordering::Relaxed), 0, "a clone is still alive");
+        drop(clone);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_logger_emit_fmt_renders_arguments_and_reports_format_errors() {
+        struct Broken;
+        impl fmt::Display for Broken {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("partial")?;
+                Err(fmt::Error)
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = Arc::clone(&calls);
+        let buf = MemBuf::default();
+        let logger = quiet()
+            .writer(buf.clone(), LogfmtFormat::new())
+            .on_error(Arc::new(move |e| {
+                assert!(matches!(e, Error::Format(_)));
+                let _n = calls2.fetch_add(1, Ordering::Relaxed);
             }))
             .build();
-        let _ = logger.try_log(Level::Info, "t", "m", &[]);
-        assert_eq!(count.load(Ordering::Relaxed), 1);
+        let n = 7;
+        logger.emit_fmt(
+            Metadata::new(Level::Info, "t"),
+            format_args!("n={n}"),
+            &[],
+            &[],
+        );
+        logger.emit_fmt(
+            Metadata::new(Level::Info, "t"),
+            format_args!("{}", Broken),
+            &[],
+            &[],
+        );
+        let out = buf.text();
+        assert!(out.contains("message=\"n=7\""), "{out}");
+        assert!(out.contains("message=partial"), "{out}");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_logger_timestamps_are_added_when_enabled() {
+        let buf = MemBuf::default();
+        let logger = Logger::builder()
+            .no_context()
+            .writer(buf.clone(), LogfmtFormat::new())
+            .build();
+        logger.log(Level::Info, "t", &[]);
+        assert!(buf.text().starts_with("timestamp="), "{}", buf.text());
+        let explicit = Metadata::new(Level::Info, "x").with_timestamp(5);
+        logger.try_emit(explicit, "m", &[]).unwrap();
+        assert!(buf.text().contains("timestamp=5 "), "{}", buf.text());
+    }
+
+    #[test]
+    fn test_logger_debug_lists_configuration() {
+        let logger = quiet().with_sink(crate::sink::NullSink::new()).build();
+        let text = format!("{logger:?}");
+        assert!(text.contains("flush_level: Error"), "{text}");
+        assert!(text.contains("sinks: 1"), "{text}");
+    }
+
+    #[test]
+    fn test_logger_is_unwind_safe_and_thread_safe() {
+        fn assert_traits<T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        assert_traits::<Logger>();
+    }
+
+    #[test]
+    fn test_field_buf_spills_and_reverses() {
+        let mut buf = FieldBuf::new();
+        for i in 0..20_u64 {
+            buf.push(Field::new("k", i));
+        }
+        assert_eq!(buf.as_slice().len(), 20);
+        buf.reverse();
+        assert_eq!(buf.as_slice()[0].value, Value::U64(19));
+        let mut small = FieldBuf::new();
+        small.push(Field::new("a", 1_u8));
+        small.push(Field::new("b", 2_u8));
+        small.reverse();
+        assert_eq!(small.as_slice()[0].key, "b");
     }
 }

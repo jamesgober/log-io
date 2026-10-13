@@ -10,6 +10,21 @@ use core::str::FromStr;
 /// [`Self::Debug`] < [`Self::Info`] < [`Self::Warn`] < [`Self::Error`].
 /// [`Self::Off`] is greater than all real severities and is used
 /// exclusively to disable a filter or logger entirely.
+///
+/// The set is deliberately closed (it mirrors the `log` and `tracing`
+/// crates), so the enum is exhaustive and can be matched without a
+/// wildcard arm.
+///
+/// # Examples
+///
+/// ```
+/// use log_io::Level;
+///
+/// assert!(Level::Error > Level::Warn);
+/// assert!(Level::Warn.is_enabled_at(Level::Info));
+/// assert_eq!("WARNING".parse::<Level>(), Ok(Level::Warn));
+/// assert_eq!(Level::Debug.to_string(), "debug");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Level {
@@ -33,6 +48,7 @@ impl Level {
     ///
     /// Returns `"off"` for [`Self::Off`]. This is the form emitted by
     /// formatters by default.
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -48,6 +64,7 @@ impl Level {
     ///
     /// Useful for human-readable formats that conventionally upper-case
     /// the severity column.
+    #[must_use]
     pub const fn as_str_upper(self) -> &'static str {
         match self {
             Self::Off => "OFF",
@@ -63,6 +80,7 @@ impl Level {
     ///
     /// Used by filters: a record at level `self` passes a threshold of
     /// `other` when `self.is_enabled_at(other)` is `true`.
+    #[must_use]
     pub const fn is_enabled_at(self, threshold: Self) -> bool {
         (self as u8) >= (threshold as u8)
     }
@@ -98,6 +116,9 @@ impl Ord for Level {
 }
 
 /// Error returned when a string cannot be parsed as a [`Level`].
+///
+/// Accepted spellings (ASCII case-insensitive): `off`, `trace`,
+/// `debug`, `info`, `warn`, `warning`, `error`, `err`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseLevelError;
 
@@ -138,7 +159,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ordering_is_total_and_severity_aligned() {
+    fn test_level_ordering_is_severity_aligned() {
         assert!(Level::Trace < Level::Debug);
         assert!(Level::Debug < Level::Info);
         assert!(Level::Info < Level::Warn);
@@ -147,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn is_enabled_at_respects_threshold() {
+    fn test_level_is_enabled_at_respects_threshold() {
         assert!(Level::Error.is_enabled_at(Level::Info));
         assert!(Level::Info.is_enabled_at(Level::Info));
         assert!(!Level::Debug.is_enabled_at(Level::Info));
@@ -155,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_round_trip_canonical_forms() {
+    fn test_level_parse_round_trips_canonical_forms() {
         for level in Level::ALL {
             let parsed: Level = level.as_str().parse().unwrap();
             assert_eq!(parsed, level);
@@ -167,24 +188,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_aliases() {
+    fn test_level_parse_accepts_aliases() {
         assert_eq!("warning".parse::<Level>().unwrap(), Level::Warn);
         assert_eq!("err".parse::<Level>().unwrap(), Level::Error);
     }
 
     #[test]
-    fn parse_rejects_garbage() {
+    fn test_level_parse_rejects_garbage() {
         assert!("verbose".parse::<Level>().is_err());
         assert!("".parse::<Level>().is_err());
     }
 
     #[test]
-    fn display_lowercase() {
+    fn test_parse_level_error_display_lists_accepted_values() {
+        let msg = ParseLevelError.to_string();
+        for name in ["off", "trace", "debug", "info", "warn", "error"] {
+            assert!(msg.contains(name), "{msg}");
+        }
+    }
+
+    #[test]
+    fn test_level_display_is_lowercase() {
         assert_eq!(Level::Info.to_string(), "info");
     }
 
     #[test]
-    fn upper_form() {
+    fn test_level_upper_form() {
         assert_eq!(Level::Warn.as_str_upper(), "WARN");
     }
 }

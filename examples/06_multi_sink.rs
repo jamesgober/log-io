@@ -1,5 +1,7 @@
-//! Fan a record out to multiple sinks: human-readable on stderr for
-//! developer eyes, JSON to a file for log ingest.
+//! One record, several destinations: human-readable on stderr for
+//! people, JSON in a file for ingestion.
+//!
+//! Run with `cargo run --example 06_multi_sink`.
 
 use log_io::format::JsonFormat;
 use log_io::sink::FileSink;
@@ -11,8 +13,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let logger = Logger::builder()
         .level(Level::Info)
-        .stderr_human() // pretty for dev
-        .with_sink(file_sink) // structured for ingest
+        .stderr_human()
+        .with_sink(file_sink)
         .build();
 
     log_io::info!(logger, "boot", region = "us-east-1");
