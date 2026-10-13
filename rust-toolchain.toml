@@ -1,0 +1,10 @@
+# Toolchain selection for local development and the stable CI jobs.
+#
+# The channel tracks `stable` on purpose: pinning an exact release here
+# would silently mask regressions on current stable. The MSRV (1.85, see
+# `rust-version` in Cargo.toml) is enforced separately by the CI `msrv`
+# job, which overrides this file with `RUSTUP_TOOLCHAIN=1.85.0`.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

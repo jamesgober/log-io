@@ -154,8 +154,8 @@ fn write_value<W: fmt::Write + ?Sized>(w: &mut W, v: Value<'_>) -> fmt::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::{Field, Metadata};
     use crate::Level;
+    use crate::record::{Field, Metadata};
 
     fn fmt_one(fmt: HumanFormat, record: &Record<'_>) -> String {
         let mut s = String::new();

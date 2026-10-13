@@ -228,8 +228,8 @@ fn write_json_value<W: fmt::Write + ?Sized>(w: &mut W, v: Value<'_>) -> fmt::Res
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
-    use crate::record::{Field, Metadata};
     use crate::Level;
+    use crate::record::{Field, Metadata};
 
     fn fmt_one(json: JsonFormat, record: &Record<'_>) -> String {
         let mut s = String::new();

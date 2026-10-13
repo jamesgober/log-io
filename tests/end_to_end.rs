@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use log_io::format::{HumanFormat, JsonFormat, LogfmtFormat};
 use log_io::sink::{NullSink, WriterSink};
-use log_io::{context, Field, Filter, Level, Logger, Value};
+use log_io::{Field, Filter, Level, Logger, Value, context};
 
 #[derive(Default, Clone)]
 struct Capture(Arc<Mutex<Vec<u8>>>);

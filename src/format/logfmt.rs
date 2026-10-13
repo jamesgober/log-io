@@ -147,8 +147,8 @@ fn write_logfmt_value<W: fmt::Write + ?Sized>(w: &mut W, v: Value<'_>) -> fmt::R
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
-    use crate::record::{Field, Metadata};
     use crate::Level;
+    use crate::record::{Field, Metadata};
 
     fn fmt_one(record: &Record<'_>) -> String {
         let mut s = String::new();

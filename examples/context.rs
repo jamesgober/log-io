@@ -4,7 +4,7 @@
 //! carry the trace and request IDs without the call sites needing to
 //! pass them explicitly.
 
-use log_io::{context, Field, Level, Logger};
+use log_io::{Field, Level, Logger, context};
 
 fn main() {
     let logger = Logger::builder().level(Level::Info).stdout_logfmt().build();

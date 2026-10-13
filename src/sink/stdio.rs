@@ -3,7 +3,7 @@
 use std::io::{self, Stderr, Stdout};
 use std::sync::Mutex;
 
-use super::{flush_locked, write_locked, Sink};
+use super::{Sink, flush_locked, write_locked};
 use crate::error::Result;
 use crate::format::Format;
 use crate::record::Record;

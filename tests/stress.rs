@@ -14,7 +14,7 @@ use std::thread;
 
 use log_io::format::{HumanFormat, JsonFormat, LogfmtFormat};
 use log_io::sink::NullSink;
-use log_io::{context, Field, Level, Logger, Record, Result, Sink};
+use log_io::{Field, Level, Logger, Record, Result, Sink, context};
 
 #[derive(Default, Clone)]
 struct Capture(Arc<Mutex<Vec<u8>>>);
