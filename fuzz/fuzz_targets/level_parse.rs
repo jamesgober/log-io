@@ -1,12 +1,13 @@
 #![no_main]
-//! Fuzz target: Level parser.
+//! Fuzz target: `Level::from_str` never panics, and accepts exactly the
+//! documented spellings.
 
 use libfuzzer_sys::fuzz_target;
 use log_io::Level;
 
-fuzz_target!(|data: &[u8]| {
-    let Ok(s) = std::str::from_utf8(data) else {
-        return;
-    };
-    let _ = s.parse::<Level>();
+fuzz_target!(|s: &str| {
+    let accepted = ["off", "trace", "debug", "info", "warn", "warning", "error", "err"]
+        .iter()
+        .any(|name| s.eq_ignore_ascii_case(name));
+    assert_eq!(s.parse::<Level>().is_ok(), accepted);
 });

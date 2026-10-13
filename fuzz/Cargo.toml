@@ -8,9 +8,14 @@ rust-version = "1.85"
 [package.metadata]
 cargo-fuzz = true
 
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
+arbitrary = { version = "1", features = ["derive"] }
 libfuzzer-sys = "0.4"
 log-io = { path = ".." }
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
 [[bin]]
 name = "filter_directive"
@@ -19,8 +24,14 @@ test = false
 doc = false
 
 [[bin]]
-name = "json_escape"
-path = "fuzz_targets/json_escape.rs"
+name = "level_parse"
+path = "fuzz_targets/level_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "json_format"
+path = "fuzz_targets/json_format.rs"
 test = false
 doc = false
 
@@ -31,8 +42,14 @@ test = false
 doc = false
 
 [[bin]]
-name = "level_parse"
-path = "fuzz_targets/level_parse.rs"
+name = "human_format"
+path = "fuzz_targets/human_format.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "logger_pipeline"
+path = "fuzz_targets/logger_pipeline.rs"
 test = false
 doc = false
 
