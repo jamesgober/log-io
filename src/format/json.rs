@@ -78,54 +78,105 @@ impl JsonFormat {
         self
     }
 
+    // Kept out of line: it runs once per record, and inlining it into
+    // every sink's write path made pipeline timings depend on unrelated
+    // code layout (measured swings of 60% between builds).
+    #[inline(never)]
     fn write_impl<W: fmt::Write + ?Sized>(&self, record: &Record<'_>, w: &mut W) -> fmt::Result {
-        let mut out = Writer {
-            w,
-            pretty: self.pretty,
-            first: true,
-        };
-        out.w.write_char('{')?;
+        let p = if self.pretty { &PRETTY } else { &COMPACT };
+        w.write_str(p.open)?;
         if let Some(ts) = record.metadata.timestamp_unix_nanos {
-            out.key_raw("timestamp")?;
+            w.write_str(p.timestamp)?;
             if self.timestamp_rfc3339 {
-                out.w.write_char('"')?;
-                super::rfc3339::write_rfc3339_nanos(ts, out.w)?;
-                out.w.write_char('"')?;
+                w.write_char('"')?;
+                super::rfc3339::write_rfc3339_nanos(ts, w)?;
+                w.write_char('"')?;
             } else {
-                write!(out.w, "{ts}")?;
+                write!(w, "{ts}")?;
             }
+            w.write_str(p.next)?;
         }
-        out.key_raw("level")?;
-        out.w.write_char('"')?;
-        out.w.write_str(record.metadata.level.as_str())?;
-        out.w.write_char('"')?;
-
-        out.key_raw("target")?;
-        write_string(out.w, record.metadata.target)?;
-
-        out.key_raw("message")?;
-        write_string(out.w, record.message)?;
-
+        w.write_str(p.level)?;
+        w.write_str(record.metadata.level.as_str())?;
+        w.write_str(p.target)?;
+        write_string(w, record.metadata.target)?;
+        w.write_str(p.message)?;
+        write_string(w, record.message)?;
         if let Some(file) = record.metadata.file {
-            out.key_raw("file")?;
-            write_string(out.w, file)?;
+            w.write_str(p.file)?;
+            write_string(w, file)?;
         }
         if let Some(line) = record.metadata.line {
-            out.key_raw("line")?;
-            write!(out.w, "{line}")?;
+            w.write_str(p.line)?;
+            write!(w, "{line}")?;
         }
-
         for field in record.all_fields() {
-            out.key_user(field.key)?;
-            write_value(out.w, field.value)?;
+            w.write_str(p.field)?;
+            if is_reserved_key(field.key) {
+                w.write_str(RESERVED_PREFIX)?;
+            }
+            write_json_escaped(w, field.key)?;
+            w.write_str(p.key_end)?;
+            write_value(w, field.value)?;
         }
-
-        if self.pretty {
-            out.w.write_char('\n')?;
-        }
-        out.w.write_str("}\n")
+        w.write_str(p.close)
     }
 }
+
+/// Punctuation for one layout. The metadata keys always appear in the
+/// same order, so every separator is a fixed string and each one is a
+/// single write.
+struct Punctuation {
+    open: &'static str,
+    timestamp: &'static str,
+    next: &'static str,
+    level: &'static str,
+    target: &'static str,
+    message: &'static str,
+    file: &'static str,
+    line: &'static str,
+    field: &'static str,
+    key_end: &'static str,
+    close: &'static str,
+}
+
+const COMPACT: Punctuation = Punctuation {
+    open: "{",
+    timestamp: "\"timestamp\":",
+    next: ",",
+    level: "\"level\":\"",
+    target: "\",\"target\":",
+    message: ",\"message\":",
+    file: ",\"file\":",
+    line: ",\"line\":",
+    field: ",\"",
+    key_end: "\":",
+    close: "}
+",
+};
+
+const PRETTY: Punctuation = Punctuation {
+    open: "{
+  ",
+    timestamp: "\"timestamp\": ",
+    next: ",
+  ",
+    level: "\"level\": \"",
+    target: "\",
+  \"target\": ",
+    message: ",
+  \"message\": ",
+    file: ",
+  \"file\": ",
+    line: ",
+  \"line\": ",
+    field: ",
+  \"",
+    key_end: "\": ",
+    close: "
+}
+",
+};
 
 impl Format for JsonFormat {
     fn write_record(&self, record: &Record<'_>, writer: &mut dyn fmt::Write) -> fmt::Result {
@@ -139,50 +190,6 @@ impl Format for JsonFormat {
         writer: &mut W,
     ) -> fmt::Result {
         self.write_impl(record, writer)
-    }
-}
-
-/// Tracks separators while an object is being written.
-struct Writer<'w, W: ?Sized> {
-    w: &'w mut W,
-    pretty: bool,
-    first: bool,
-}
-
-impl<W: fmt::Write + ?Sized> Writer<'_, W> {
-    #[inline]
-    fn separator(&mut self) -> fmt::Result {
-        if self.first {
-            self.first = false;
-        } else {
-            self.w.write_char(',')?;
-        }
-        if self.pretty {
-            self.w.write_str("\n  ")?;
-        }
-        Ok(())
-    }
-
-    /// A key the formatter itself controls (already valid JSON text).
-    #[inline]
-    fn key_raw(&mut self, key: &str) -> fmt::Result {
-        self.separator()?;
-        self.w.write_char('"')?;
-        self.w.write_str(key)?;
-        self.w.write_str(if self.pretty { "\": " } else { "\":" })
-    }
-
-    /// A user key: escaped, and prefixed when it collides with a
-    /// reserved key.
-    #[inline]
-    fn key_user(&mut self, key: &str) -> fmt::Result {
-        self.separator()?;
-        self.w.write_char('"')?;
-        if is_reserved_key(key) {
-            self.w.write_str(RESERVED_PREFIX)?;
-        }
-        write_json_escaped(self.w, key)?;
-        self.w.write_str(if self.pretty { "\": " } else { "\":" })
     }
 }
 

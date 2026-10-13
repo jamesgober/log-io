@@ -3,7 +3,7 @@
 use std::io::Write;
 use std::sync::Mutex;
 
-use super::{Sink, flush_locked, lock_recover, write_locked};
+use super::{CachePadded, Sink, flush_locked, lock_recover, write_locked};
 use crate::error::Result;
 use crate::format::Format;
 use crate::record::Record;
@@ -28,7 +28,7 @@ use crate::record::Record;
 /// ```
 pub struct WriterSink<W: Write + Send, F: Format> {
     format: F,
-    target: Mutex<W>,
+    target: CachePadded<Mutex<W>>,
 }
 
 impl<W: Write + Send, F: Format> WriterSink<W, F> {
@@ -36,7 +36,7 @@ impl<W: Write + Send, F: Format> WriterSink<W, F> {
     pub const fn new(writer: W, format: F) -> Self {
         Self {
             format,
-            target: Mutex::new(writer),
+            target: CachePadded(Mutex::new(writer)),
         }
     }
 
@@ -63,6 +63,7 @@ impl<W: Write + Send, F: Format> WriterSink<W, F> {
     /// Consume the sink and return the writer.
     pub fn into_inner(self) -> W {
         self.target
+            .0
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }

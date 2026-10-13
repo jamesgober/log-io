@@ -236,6 +236,7 @@ impl Logger {
     /// per-target filter rules only apply to this record if they match
     /// the default target; the macros use the calling module's path
     /// instead.
+    #[inline]
     pub fn log(&self, level: Level, message: &str, fields: &[Field<'_>]) {
         let _reported_to_handler = self.try_log(level, &self.inner.default_target, message, fields);
     }
@@ -246,6 +247,7 @@ impl Logger {
     ///
     /// Returns the first sink or flush error. Every sink still receives
     /// the record, and every error is also passed to the error handler.
+    #[inline]
     pub fn try_log(
         &self,
         level: Level,
@@ -264,6 +266,7 @@ impl Logger {
     /// # Errors
     ///
     /// Same as [`Logger::try_log`].
+    #[inline]
     pub fn try_emit(
         &self,
         metadata: Metadata<'_>,
@@ -396,9 +399,8 @@ impl Logger {
         ctx: &[Field<'_>],
         extra: &[Field<'_>],
     ) -> Result<()> {
-        let defaults = &self.inner.defaults;
         let redacting = !self.inner.redact.is_empty();
-        if defaults.is_empty()
+        if self.inner.defaults.is_empty()
             && extra.is_empty()
             && !redacting
             && (ctx.is_empty() || !any_key_in(ctx, fields))
@@ -406,26 +408,57 @@ impl Logger {
             return self.dispatch(&Record::with_context(metadata, message, fields, ctx));
         }
 
-        let mut call = FieldBuf::new();
-        let fields = if redacting && fields.iter().any(|f| self.is_redacted(f.key)) {
+        // Common case: default fields only (no thread or extra context,
+        // no redaction). Defaults have unique keys by construction, so
+        // only collisions with call fields need checking.
+        let defaults = &self.inner.defaults;
+        if ctx.is_empty() && extra.is_empty() && !redacting && defaults.len() <= INLINE_FIELDS {
+            let mut buf = [EMPTY_FIELD; INLINE_FIELDS];
+            let mut len = 0;
+            for owned in defaults {
+                if !fields.iter().any(|f| f.key == &*owned.key) {
+                    buf[len] = owned.as_field();
+                    len += 1;
+                }
+            }
+            return self.dispatch(&Record::with_context(
+                metadata,
+                message,
+                fields,
+                &buf[..len],
+            ));
+        }
+
+        if redacting && fields.iter().any(|f| self.is_redacted(f.key)) {
+            let mut call = FieldBuf::new();
             for f in fields {
                 call.push(self.redacted(*f));
             }
-            call.as_slice()
+            self.merge_ambient(metadata, message, call.as_slice(), ctx, extra)
         } else {
-            fields
-        };
+            self.merge_ambient(metadata, message, fields, ctx, extra)
+        }
+    }
 
+    /// Merge defaults, thread context and extra context into one
+    /// de-duplicated, redacted slice, then dispatch.
+    fn merge_ambient(
+        &self,
+        metadata: Metadata<'_>,
+        message: &str,
+        fields: &[Field<'_>],
+        ctx: &[Field<'_>],
+        extra: &[Field<'_>],
+    ) -> Result<()> {
         // Highest precedence first; each layer newest first. Reversed
         // at the end so the output keeps defaults, context, extra order.
         let mut ambient = FieldBuf::new();
-        let layers = [extra, ctx];
-        for layer in layers {
+        for layer in [extra, ctx] {
             for f in layer.iter().rev() {
                 self.push_ambient(&mut ambient, *f, fields);
             }
         }
-        for owned in defaults.iter().rev() {
+        for owned in self.inner.defaults.iter().rev() {
             self.push_ambient(&mut ambient, owned.as_field(), fields);
         }
         ambient.reverse();
@@ -515,22 +548,26 @@ impl fmt::Debug for Logger {
     }
 }
 
-/// Up to 16 fields on the stack, spilling to the heap beyond that.
+/// Fields kept on the stack before spilling to the heap.
+const INLINE_FIELDS: usize = 16;
+
+const EMPTY_FIELD: Field<'static> = Field {
+    key: "",
+    value: Value::Null,
+};
+
+/// Up to [`INLINE_FIELDS`] fields on the stack, spilling to the heap
+/// beyond that.
 struct FieldBuf<'a> {
-    stack: [Field<'a>; 16],
+    stack: [Field<'a>; INLINE_FIELDS],
     len: usize,
     heap: Vec<Field<'a>>,
 }
 
 impl<'a> FieldBuf<'a> {
-    const EMPTY: Field<'static> = Field {
-        key: "",
-        value: Value::Null,
-    };
-
     fn new() -> Self {
         Self {
-            stack: [Self::EMPTY; 16],
+            stack: [EMPTY_FIELD; INLINE_FIELDS],
             len: 0,
             heap: Vec::new(),
         }

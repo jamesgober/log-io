@@ -59,6 +59,10 @@ impl LogfmtFormat {
         self
     }
 
+    // Kept out of line: it runs once per record, and inlining it into
+    // every sink's write path made pipeline timings depend on unrelated
+    // code layout (measured swings of 60% between builds).
+    #[inline(never)]
     fn write_impl<W: fmt::Write + ?Sized>(&self, record: &Record<'_>, w: &mut W) -> fmt::Result {
         if let Some(ts) = record.metadata.timestamp_unix_nanos {
             w.write_str("timestamp=")?;

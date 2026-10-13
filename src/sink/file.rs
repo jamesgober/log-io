@@ -5,7 +5,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
-use super::{Sink, lock_recover, write_locked};
+use super::{CachePadded, Sink, lock_recover, write_locked};
 use crate::error::{Error, Result};
 use crate::format::Format;
 use crate::record::Record;
@@ -60,7 +60,7 @@ const DEFAULT_BUFFER: usize = 8 * 1024;
 /// ```
 pub struct FileSink<F: Format> {
     format: F,
-    target: Mutex<BufWriter<File>>,
+    target: CachePadded<Mutex<BufWriter<File>>>,
     sync_on_flush: bool,
 }
 
@@ -171,7 +171,10 @@ impl<F: Format> FileSinkBuilder<F> {
             .open(&self.path)?;
         Ok(FileSink {
             format: self.format,
-            target: Mutex::new(BufWriter::with_capacity(self.buffer_capacity, file)),
+            target: CachePadded(Mutex::new(BufWriter::with_capacity(
+                self.buffer_capacity,
+                file,
+            ))),
             sync_on_flush: self.sync_on_flush,
         })
     }
