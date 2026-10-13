@@ -45,7 +45,8 @@ const DEFAULT_BUFFER: usize = 8 * 1024;
 ///
 /// # Examples
 ///
-/// ```no_run
+#[cfg_attr(all(feature = "json"), doc = "```no_run")]
+#[cfg_attr(not(all(feature = "json")), doc = "```ignore")]
 /// use log_io::format::JsonFormat;
 /// use log_io::sink::FileSink;
 /// use log_io::{Level, Logger};

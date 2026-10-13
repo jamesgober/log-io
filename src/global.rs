@@ -10,7 +10,8 @@
 //! records are flushed (and background writers drained) when `main`
 //! returns:
 //!
-//! ```no_run
+#![cfg_attr(all(feature = "json"), doc = "```no_run")]
+#![cfg_attr(not(all(feature = "json")), doc = "```ignore")]
 //! use log_io::{Level, Logger};
 //!
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {

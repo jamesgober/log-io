@@ -60,7 +60,8 @@ impl std::error::Error for BuildError {
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "human"), doc = "```")]
+#[cfg_attr(not(all(feature = "human")), doc = "```ignore")]
 /// use log_io::{Level, Logger};
 ///
 /// let logger = Logger::builder()

@@ -18,7 +18,8 @@ use crate::record::Record;
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "logfmt"), doc = "```")]
+#[cfg_attr(not(all(feature = "logfmt")), doc = "```ignore")]
 /// use log_io::format::LogfmtFormat;
 /// use log_io::sink::StdoutSink;
 /// use log_io::{Level, Logger};
@@ -63,7 +64,8 @@ impl<F: Format + core::fmt::Debug> core::fmt::Debug for StdoutSink<F> {
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "human"), doc = "```")]
+#[cfg_attr(not(all(feature = "human")), doc = "```ignore")]
 /// use log_io::format::HumanFormat;
 /// use log_io::sink::StderrSink;
 /// use log_io::{Level, Logger};

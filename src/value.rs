@@ -35,7 +35,8 @@ use core::fmt;
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "std"), doc = "```")]
+#[cfg_attr(not(all(feature = "std")), doc = "```ignore")]
 /// use log_io::Value;
 ///
 /// let port: Value<'_> = 8080_u16.into();

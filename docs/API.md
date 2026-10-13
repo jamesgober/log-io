@@ -1,1435 +1,802 @@
-# log-io - API Reference
+# log-io API Reference
 
-> Complete reference for the public API of `log-io`. The rustdoc on
-> [docs.rs/log-io](https://docs.rs/log-io) is generated from the same
-> source comments; this document is the offline-friendly mirror.
+> Reference for log-io 2.0. Rustdoc on [docs.rs/log-io](https://docs.rs/log-io)
+> is authoritative for signatures; this document explains how the parts
+> fit together. Every `rust` code block here is compiled and run as a
+> doctest (`cargo test --doc --all-features`).
 
 ## Table of contents
 
 1. [Overview](#overview)
 2. [Feature flags](#feature-flags)
-3. [Crate-level items](#crate-level-items)
-4. [Data model](#data-model)
-   - [`Level`](#level)
-   - [`Value`](#value)
-   - [`Field`](#field)
-   - [`Metadata`](#metadata)
-   - [`Record`](#record)
+3. [Data model](#data-model)
+4. [Formats](#formats)
 5. [Filtering](#filtering)
-   - [`Filter`](#filter)
-   - [`FilterRule`](#filterrule)
-   - [`ParseFilterError`](#parsefiltererror)
-6. [Formats](#formats)
-   - [`Format` trait](#format-trait)
-   - [`JsonFormat`](#jsonformat)
-   - [`LogfmtFormat`](#logfmtformat)
-   - [`HumanFormat`](#humanformat)
-7. [Sinks](#sinks)
-   - [`Sink` trait](#sink-trait)
-   - [`StdoutSink`](#stdoutsink)
-   - [`StderrSink`](#stderrsink)
-   - [`FileSink`](#filesink)
-   - [`WriterSink`](#writersink)
-   - [`NullSink`](#nullsink)
-8. [Errors](#errors)
-   - [`Error`](#error)
-   - [`Result`](#result)
-9. [Logger](#logger)
-   - [`Logger`](#logger-1)
-   - [`LoggerBuilder`](#loggerbuilder)
-   - [`ErrorHandler`](#errorhandler)
-10. [Context propagation](#context-propagation)
+6. [Logger](#logger)
+7. [Global logger](#global-logger)
+8. [Durability](#durability)
+9. [Sinks](#sinks)
+10. [Context](#context)
 11. [Macros](#macros)
-12. [`no_std` support](#no_std-support)
+12. [Integrations: `log` and `tracing`](#integrations-log-and-tracing)
+13. [Errors](#errors)
+14. [Threading, async and allocation](#threading-async-and-allocation)
+15. [`no_std`](#no_std)
 
 ## Overview
 
-A record flows through three stages:
-
+```text
+caller --> Logger --> Filter --> assemble --> Sink #0 --> Format --> destination
+           (macros,    (target,    (timestamp,   Sink #1 ...
+            log,        level)      defaults,
+            tracing)                context,
+                                    dedup, redact)
 ```
-caller -> Logger -> Filter -> [Sink #0 ... Sink #N]
-                                  |
-                                  v
-                              Format -> Writer
-```
 
-- The **logger** captures wall-clock time (optional), splices in
-  thread-local context (optional) and any default fields, and
-  constructs the [`Record`].
-- The **filter** decides whether the record is admitted.
-- Each **sink** receives the same `&Record`. Sinks run sequentially
-  in insertion order. The first error is surfaced, but every sink
-  still receives the record so a single failure does not starve the
-  others.
+- The **logger** checks the filter, stamps the time, gathers ambient
+  fields (default fields, thread-local context, and context supplied by
+  an integration), removes duplicate keys, redacts configured keys, and
+  passes one `Record` to each sink in turn.
+- The **filter** decides by target and level. The most specific rule
+  wins.
+- Each **sink** formats the record and writes it. A failing sink does
+  not stop the others.
+- Records at or above the **flush level** (default `Error`) are flushed
+  to every sink before the call returns.
 
 ## Feature flags
 
-| Flag     | Default | Effect                                                       |
-|----------|---------|--------------------------------------------------------------|
-| `std`    | yes     | Enables `Logger`, sinks, context, timestamps.                |
-| `json`   | yes     | Enables [`JsonFormat`].                                      |
-| `logfmt` | yes     | Enables [`LogfmtFormat`].                                    |
-| `human`  | yes     | Enables [`HumanFormat`].                                     |
+| Feature | Default | Enables |
+|---|---|---|
+| `std` | yes | `Logger`, sinks, context, timestamps, global logger, macros |
+| `json` | yes | `format::JsonFormat` |
+| `logfmt` | yes | `format::LogfmtFormat` |
+| `human` | yes | `format::HumanFormat` (works without `std`) |
+| `log` | no | `compat::LogBridge` (adds the `log` crate) |
+| `tracing` | no | `compat::TracingLayer` (adds `tracing-core`, `tracing-subscriber`) |
 
-With `default-features = false`, the crate compiles in `no_std` mode
-exposing only the data model, the `Format` trait, and any formatters
-whose flags are still enabled. See [`no_std` support](#no_std-support).
-
-## Crate-level items
-
-### `VERSION`
-
-```rust
-pub const VERSION: &str;
-```
-
-The crate version as set by Cargo at build time.
-
-```rust
-assert_eq!(log_io::VERSION, env!("CARGO_PKG_VERSION"));
-```
+Without `std` the crate is `no_std` and needs no allocator.
 
 ## Data model
 
+All data-model types borrow; building a record never allocates.
+
 ### `Level`
 
-```rust
-pub enum Level {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
-    Off,
-}
-```
-
-Severity of a log record. Ordered from least to most severe; `Off`
-is a sentinel above `Error` used to mean "admit nothing" in filter
-thresholds.
-
-#### `Level::as_str`
-
-```rust
-pub const fn as_str(self) -> &'static str;
-```
-
-Canonical lowercase name (`"trace"`, `"debug"`, ..., `"off"`).
+`Trace < Debug < Info < Warn < Error < Off`. `Off` is a filter
+threshold meaning "nothing"; records never carry it (a record at `Off`
+is never admitted). The enum is exhaustive.
 
 ```rust
 use log_io::Level;
-assert_eq!(Level::Info.as_str(), "info");
-```
 
-#### `Level::as_str_upper`
-
-```rust
-pub const fn as_str_upper(self) -> &'static str;
-```
-
-Uppercase form used by [`HumanFormat`].
-
-```rust
-use log_io::Level;
+assert!(Level::Warn > Level::Info);
+assert!(Level::Error.is_enabled_at(Level::Warn));
+assert_eq!(Level::Warn.as_str(), "warn");
 assert_eq!(Level::Warn.as_str_upper(), "WARN");
-```
-
-#### `Level::is_enabled_at`
-
-```rust
-pub const fn is_enabled_at(self, threshold: Self) -> bool;
-```
-
-Returns `true` if `self` is at or above `threshold`.
-
-```rust
-use log_io::Level;
-assert!(Level::Error.is_enabled_at(Level::Info));
-assert!(!Level::Debug.is_enabled_at(Level::Info));
-```
-
-#### `Level::ALL`
-
-```rust
-pub const ALL: [Self; 5];
-```
-
-Every real severity in ascending order. Excludes `Off`.
-
-```rust
-use log_io::Level;
-for level in Level::ALL {
-    println!("{}", level.as_str());
-}
-```
-
-#### `FromStr` and `Display`
-
-```rust
-impl FromStr for Level { type Err = ParseLevelError; }
-impl Display for Level;
-```
-
-Parsing accepts case-insensitive canonical forms (`off`, `trace`,
-`debug`, `info`, `warn`, `error`) and the aliases `warning` /
-`err`. Display writes the lowercase form.
-
-```rust
-use log_io::Level;
-let lvl: Level = "INFO".parse().unwrap();
-assert_eq!(lvl, Level::Info);
-let lvl: Level = "warning".parse().unwrap();
-assert_eq!(lvl, Level::Warn);
-```
-
-### `ParseLevelError`
-
-```rust
-pub struct ParseLevelError;
-```
-
-Returned by `Level::from_str` when the input doesn't match any
-canonical form or alias.
-
-```rust
-use log_io::Level;
-assert!("verbose".parse::<Level>().is_err());
+assert_eq!("WARNING".parse::<Level>(), Ok(Level::Warn)); // also "err"
+assert_eq!(Level::ALL.len(), 5); // Off excluded
 ```
 
 ### `Value`
 
 ```rust
-pub enum Value<'a> {
-    Null,
-    Bool(bool),
-    I64(i64),
-    U64(u64),
-    F64(f64),
-    Str(&'a str),
-    Char(char),
-}
-```
-
-A borrowed field value. The `'a` lifetime ties string values to the
-caller's stack so records carry no heap allocation.
-
-#### Constructors via `From`
-
-```rust
 use log_io::Value;
 
-let s: Value = "hello".into();              // Value::Str
-let n: Value = 42_u64.into();               // Value::U64
-let b: Value = true.into();                 // Value::Bool
-let f: Value = 1.5_f64.into();              // Value::F64
-let null: Value = Option::<u32>::None.into(); // Value::Null
-```
-
-`From` is implemented for `&str`, `bool`, `char`, every primitive
-integer (signed and unsigned), `f32`, `f64`, and `Option<T>` where
-`T: Into<Value<'a>>`.
-
-#### `Value::is_null`
-
-```rust
-pub const fn is_null(&self) -> bool;
-```
-
-Returns `true` if and only if the variant is `Null`.
-
-#### `Value::variant_name`
-
-```rust
-pub const fn variant_name(&self) -> &'static str;
-```
-
-Diagnostic-friendly variant name (e.g. `"u64"`, `"str"`).
-
-#### `Default` and `Display`
-
-```rust
-impl Default for Value<'_>;   // returns Value::Null
-impl Display for Value<'_>;
-```
-
-`Display` formats each variant's payload in the obvious way; `Null`
-renders as the string `"null"`.
-
-```rust
-use log_io::Value;
-assert_eq!(Value::U64(5).to_string(), "5");
-assert_eq!(Value::Null.to_string(), "null");
-```
-
-### `Field`
-
-```rust
-pub struct Field<'a> {
-    pub key: &'a str,
-    pub value: Value<'a>,
-}
-```
-
-A key-value pair attached to a [`Record`]. Both key and value are
-borrowed; the field cannot outlive their backing data.
-
-#### `Field::new`
-
-```rust
-pub fn new<V: Into<Value<'a>>>(key: &'a str, value: V) -> Self;
-```
-
-**Parameters**
-
-| Name    | Type                 | Description                            |
-|---------|----------------------|----------------------------------------|
-| `key`   | `&'a str`            | Field name. Should be unique per record. |
-| `value` | `impl Into<Value>`   | Any value convertible to a `Value`.    |
-
-```rust
-use log_io::{Field, Value};
-
-let f = Field::new("port", 8080_u32);
-assert_eq!(f.key, "port");
-assert_eq!(f.value, Value::U64(8080));
-
+let n: Value<'_> = 42_u8.into();                      // U64(42)
+let big: Value<'_> = u128::MAX.into();                // U128
 let s = String::from("alice");
-let f = Field::new("user", s.as_str()); // borrow at the call site
+let v: Value<'_> = (&s).into();                       // Str("alice")
+let bytes: Value<'_> = (&[0xde_u8, 0xad][..]).into(); // Bytes, written as "dead"
+let addr = std::net::Ipv4Addr::LOCALHOST;
+let lazy = Value::Display(&addr);                     // rendered only if written
+let err = std::io::Error::other("disk full");
+let chain = Value::Error(&err);                       // "disk full: <source>: ..."
+assert_eq!(lazy.to_string(), "127.0.0.1");
+assert_eq!(bytes.to_string(), "dead");
+assert!(Value::Null.is_null());
+assert_eq!(n.variant_name(), "u64");
+# let _ = (big, v, chain);
 ```
 
-### `Metadata`
+`Value` is `#[non_exhaustive]`; match it with a wildcard arm. The lazy
+variants (`Display`, `Debug`, `Error`) hold trait-object references, so
+`Value` is not `Send`/`Sync`, and `PartialEq` compares them by identity.
 
-```rust
-pub struct Metadata<'a> {
-    pub level: Level,
-    pub target: &'a str,
-    pub file: Option<&'a str>,
-    pub line: Option<u32>,
-    pub timestamp_unix_nanos: Option<u128>,
-}
-```
+How each format writes values:
 
-Origin and severity information for a record.
+| Variant | JSON | logfmt | human |
+|---|---|---|---|
+| `Null` | `null` | empty | `<null>` |
+| `Bool`, integers | literal | literal | literal |
+| `F64` finite | `{:?}` text, e.g. `1.0`, `1e300` | same | same |
+| `F64` NaN / inf | `null` | `NaN` / `inf` / `-inf` | same as logfmt |
+| `Str`, `Char` | escaped string | quoted when needed | quoted when needed |
+| `Bytes` | lowercase hex string | lowercase hex | lowercase hex |
+| `Display`, `Debug`, `Error` | escaped string | quoted when needed | quoted when needed |
 
-| Field                  | Required | Description                                  |
-|------------------------|----------|----------------------------------------------|
-| `level`                | yes      | Severity.                                    |
-| `target`               | yes      | Logical target (usually `module_path!()`).   |
-| `file`                 | no       | Source file path (set by macros).            |
-| `line`                 | no       | Source line number (set by macros).          |
-| `timestamp_unix_nanos` | no       | Nanoseconds since Unix epoch.                |
-
-#### `Metadata::new`
-
-```rust
-pub const fn new(level: Level, target: &'a str) -> Self;
-```
-
-Minimal constructor; all optional fields are `None`.
-
-```rust
-use log_io::{Level, Metadata};
-let m = Metadata::new(Level::Info, "app");
-```
-
-#### `Metadata::with_location`
-
-```rust
-pub const fn with_location(self, file: &'a str, line: u32) -> Self;
-```
-
-Attach source location.
-
-```rust
-use log_io::{Level, Metadata};
-let m = Metadata::new(Level::Info, "app").with_location("src/lib.rs", 42);
-```
-
-#### `Metadata::with_timestamp`
-
-```rust
-pub const fn with_timestamp(self, ts_unix_nanos: u128) -> Self;
-```
-
-Attach an explicit timestamp. The logger sets this automatically
-unless `LoggerBuilder::no_timestamps` was called.
-
-```rust
-use log_io::{Level, Metadata};
-let m = Metadata::new(Level::Info, "app").with_timestamp(1_700_000_000_000_000_000);
-```
-
-### `Record`
-
-```rust
-pub struct Record<'a> {
-    pub metadata: Metadata<'a>,
-    pub message: &'a str,
-    pub fields: &'a [Field<'a>],
-    pub context: &'a [Field<'a>],
-}
-```
-
-The immutable unit dispatched through the pipeline. `context` holds
-default fields and thread-local context; `fields` holds per-call
-fields.
-
-#### `Record::new`
-
-```rust
-pub const fn new(metadata: Metadata<'a>, message: &'a str, fields: &'a [Field<'a>]) -> Self;
-```
-
-Build a record with no context fields.
+### `Field`, `Metadata`, `Record`
 
 ```rust
 use log_io::{Field, Level, Metadata, Record};
 
-let fields = [Field::new("port", 80_u32)];
-let r = Record::new(Metadata::new(Level::Info, "app"), "started", &fields);
-```
-
-#### `Record::with_context`
-
-```rust
-pub const fn with_context(
-    metadata: Metadata<'a>,
-    message: &'a str,
-    fields: &'a [Field<'a>],
-    context: &'a [Field<'a>],
-) -> Self;
-```
-
-Build a record with explicit context fields. The [`Logger`] uses
-this form internally to splice in thread-local context.
-
-#### `Record::all_fields`
-
-```rust
-pub fn all_fields(&self) -> impl Iterator<Item = &Field<'a>>;
-```
-
-Iterate over context fields followed by per-call fields. Most
-formatters render in this order so context appears before the
-call-site data.
-
-```rust
-use log_io::{Field, Level, Metadata, Record};
-
+let meta = Metadata::new(Level::Info, "app::http")
+    .with_location("src/http.rs", 42)
+    .with_timestamp(1_700_000_000_000_000_000);
+let fields = [Field::new("status", 200_u16)];
 let ctx = [Field::new("trace_id", "abc")];
-let fields = [Field::new("port", 80_u32)];
-let r = Record::with_context(
-    Metadata::new(Level::Info, "app"),
-    "served",
-    &fields,
-    &ctx,
-);
-for f in r.all_fields() {
-    println!("{} = {:?}", f.key, f.value);
-}
+let record = Record::with_context(meta, "handled", &fields, &ctx);
+
+assert_eq!(record.metadata.line, Some(42));
+let keys: Vec<&str> = record.all_fields().map(|f| f.key).collect();
+assert_eq!(keys, ["trace_id", "status"]); // context first
 ```
 
-## Filtering
-
-### `Filter`
-
-```rust
-pub struct Filter { /* opaque */ }
-```
-
-A target-aware severity gate. Pairs a default level with zero or
-more per-target overrides.
-
-#### `Filter::new`
-
-```rust
-pub fn new(default_level: Level) -> Self;
-```
-
-Filter with the given default and no overrides.
-
-```rust
-use log_io::{Filter, Level};
-let f = Filter::new(Level::Info);
-```
-
-#### `Filter::with_rule`
-
-```rust
-pub fn with_rule(self, target: impl Into<String>, level: Level) -> Self;
-```
-
-Add a per-target override. Rules are checked in insertion order;
-the first matching prefix wins, so add the most specific prefix
-first.
-
-```rust
-use log_io::{Filter, Level};
-let f = Filter::new(Level::Warn)
-    .with_rule("app::auth", Level::Debug)
-    .with_rule("hyper", Level::Off);
-```
-
-#### `Filter::default_level`
-
-```rust
-pub fn default_level(&self) -> Level;
-```
-
-The configured default.
-
-#### `Filter::rules`
-
-```rust
-pub fn rules(&self) -> &[FilterRule];
-```
-
-The configured rules in insertion order.
-
-#### `Filter::is_enabled`
-
-```rust
-pub fn is_enabled(&self, target: &str, level: Level) -> bool;
-```
-
-`true` if a record at `level` targeted at `target` would be
-admitted.
-
-```rust
-use log_io::{Filter, Level};
-let f = Filter::new(Level::Warn).with_rule("app", Level::Debug);
-assert!(f.is_enabled("app", Level::Debug));
-assert!(!f.is_enabled("other", Level::Info));
-```
-
-#### `Filter::threshold_for`
-
-```rust
-pub fn threshold_for(&self, target: &str) -> Level;
-```
-
-The effective threshold the filter applies to `target`. Useful for
-implementing call-site short-circuits.
-
-#### `Filter::parse`
-
-```rust
-pub fn parse(directive: &str) -> Result<Self, ParseFilterError>;
-```
-
-Parse a directive of the form `<default>[, <target>=<level>]*`.
-Matching is prefix-based on `::` / `.` module boundaries.
-
-```rust
-use log_io::{Filter, Level};
-let f = Filter::parse("warn, app::auth=debug, hyper=off").unwrap();
-assert_eq!(f.default_level(), Level::Warn);
-assert!(f.is_enabled("app::auth::login", Level::Debug));
-assert!(!f.is_enabled("hyper", Level::Error));
-```
-
-### `FilterRule`
-
-```rust
-pub struct FilterRule {
-    pub target: String,
-    pub level: Level,
-}
-```
-
-One rule in a [`Filter`]. Constructed via [`FilterRule::new`] or
-implicitly by [`Filter::with_rule`].
-
-```rust
-pub fn new(target: impl Into<String>, level: Level) -> Self;
-```
-
-### `ParseFilterError`
-
-```rust
-pub struct ParseFilterError;
-```
-
-Returned by [`Filter::parse`] when any segment is malformed.
+`Metadata` and `Record` are `#[non_exhaustive]`: construct them with
+these functions; all fields stay readable.
 
 ## Formats
 
-### `Format` trait
+### The `Format` trait
 
-```rust
+```text
 pub trait Format: Send + Sync {
-    fn write_record<W: core::fmt::Write + ?Sized>(
-        &self,
-        record: &Record<'_>,
-        writer: &mut W,
-    ) -> core::fmt::Result;
+    fn write_record(&self, record: &Record<'_>, writer: &mut dyn fmt::Write) -> fmt::Result;
+    fn write_record_generic<W: fmt::Write>(&self, record: &Record<'_>, writer: &mut W)
+        -> fmt::Result where Self: Sized { /* calls write_record */ }
 }
 ```
 
-The serialization stage of the pipeline. Implementors write to any
-[`core::fmt::Write`] sink so the trait is usable in `no_std`.
-
-The trait is implemented for `&T`, `Box<T>`, and `Arc<T>` where `T:
-Format`.
-
-**Implementing a custom format**
+`write_record` is object-safe, so `Box<dyn Format>`, `&dyn Format` and
+`Arc<dyn Format>` work and a format can be chosen at run time. The
+built-in sinks call `write_record_generic`, which the built-in formats
+override with a monomorphized implementation (dynamic dispatch through
+`&mut dyn fmt::Write` costs 40-60% more per record for them).
 
 ```rust
 use core::fmt;
-use log_io::{format::Format, Record};
+use log_io::format::{self, Format, JsonFormat};
+use log_io::{Level, Logger, Metadata, Record};
 
-struct CompactFormat;
-
-impl Format for CompactFormat {
-    fn write_record<W: fmt::Write + ?Sized>(
-        &self,
-        record: &Record<'_>,
-        writer: &mut W,
-    ) -> fmt::Result {
-        write!(
-            writer,
-            "{}|{}|{}\n",
-            record.metadata.level.as_str(),
-            record.metadata.target,
-            record.message,
-        )
+struct Tsv;
+impl Format for Tsv {
+    fn write_record(&self, r: &Record<'_>, w: &mut dyn fmt::Write) -> fmt::Result {
+        writeln!(w, "{}\t{}\t{}", r.metadata.level, r.metadata.target, r.message)
     }
 }
+
+let closure = format::from_fn(|r: &Record<'_>, w: &mut dyn fmt::Write| {
+    writeln!(w, "{}", r.message)
+});
+
+let pick_json = true;
+let chosen: Box<dyn Format> = if pick_json { Box::new(JsonFormat::new()) } else { Box::new(Tsv) };
+let logger = Logger::builder().stdout(chosen).stderr(closure).build();
+# let _ = logger;
+
+let mut out = String::new();
+Tsv.write_record(&Record::new(Metadata::new(Level::Info, "t"), "m", &[]), &mut out)?;
+assert_eq!(out, "info\tt\tm\n");
+# Ok::<(), fmt::Error>(())
 ```
+
+### Output safety (all built-in formats)
+
+- C0 controls, DEL, C1 controls, U+2028, U+2029 and the bidirectional
+  embedding / override / isolate characters are always escaped. A
+  record is exactly one line (except pretty JSON) and cannot carry
+  terminal escape sequences.
+- JSON and logfmt reserve `timestamp`, `level`, `target`, `message`,
+  `file`, `line`. A user field with one of those names is written as
+  `fields.<name>`.
 
 ### `JsonFormat`
 
-```rust
-pub struct JsonFormat { /* opaque */ }
-```
-
-Line-delimited JSON. Each record emits one JSON object terminated
-by `\n`. Available behind `feature = "json"`.
-
-Field order: `timestamp` (if set), `level`, `target`, `message`,
-`file`, `line`, then context fields, then per-call fields.
-
-#### `JsonFormat::new` / `JsonFormat::default`
+One object per line: `timestamp`, `level`, `target`, `message`, `file`,
+`line`, then context fields, then call fields.
 
 ```rust
-pub const fn new() -> Self;
-impl Default for JsonFormat;
+use log_io::format::{Format, JsonFormat};
+use log_io::{Field, Level, Metadata, Record};
+
+let fields = [Field::new("ratio", 1.0), Field::new("message", "spoof")];
+let rec = Record::new(Metadata::new(Level::Info, "app").with_timestamp(0), "up", &fields);
+
+let mut out = String::new();
+JsonFormat::new().write_record(&rec, &mut out)?;
+assert_eq!(
+    out,
+    "{\"timestamp\":0,\"level\":\"info\",\"target\":\"app\",\"message\":\"up\",\
+      \"ratio\":1.0,\"fields.message\":\"spoof\"}\n"
+);
+
+out.clear();
+JsonFormat::new().timestamp_rfc3339(true).write_record(&rec, &mut out)?;
+assert!(out.starts_with("{\"timestamp\":\"1970-01-01T00:00:00.000000000Z\""));
+# Ok::<(), core::fmt::Error>(())
 ```
 
-Compact JSON, unix-nanosecond timestamps.
-
-```rust
-use log_io::format::JsonFormat;
-let fmt = JsonFormat::new();
-```
-
-#### `JsonFormat::pretty`
-
-```rust
-pub const fn pretty(self, enabled: bool) -> Self;
-```
-
-Toggle indented multi-line output. Intended for hand inspection,
-not for ingest pipelines.
-
-```rust
-use log_io::format::JsonFormat;
-let fmt = JsonFormat::new().pretty(true);
-```
-
-#### `JsonFormat::timestamp_rfc3339`
-
-```rust
-pub const fn timestamp_rfc3339(self, enabled: bool) -> Self;
-```
-
-Emit timestamps as RFC 3339 strings (`"2026-05-18T13:24:01.123456789Z"`)
-instead of Unix nanoseconds.
-
-```rust
-use log_io::format::JsonFormat;
-let fmt = JsonFormat::new().timestamp_rfc3339(true);
-```
+`pretty(true)` indents for reading by eye. Nanosecond integer timestamps
+exceed 2^53; consumers that parse numbers as doubles should use
+`timestamp_rfc3339(true)`. RFC 3339 output is clamped at
+`9999-12-31T23:59:59.999999999Z`.
 
 ### `LogfmtFormat`
 
-```rust
-pub struct LogfmtFormat { /* opaque */ }
-```
-
-`key=value key=value ...\n` lines. Values containing whitespace,
-`=`, or `"` are double-quoted with escapes; bare alphanumerics are
-emitted unquoted. Available behind `feature = "logfmt"`.
+`key=value` pairs. Values that are empty or contain whitespace, `=`,
+`"`, `\` or a special character are quoted with JSON-compatible escapes
+(`\"`, `\\`, `\n`, `\u001b`). Keys are never quoted: whitespace, `=`,
+`"` and special characters become `_`; an empty key becomes `_`.
 
 ```rust
-use log_io::format::LogfmtFormat;
-let fmt = LogfmtFormat::new();
+use log_io::format::{Format, LogfmtFormat};
+use log_io::{Field, Level, Metadata, Record};
+
+let fields = [Field::new("path", "/a b"), Field::new("bad key", 1_u8)];
+let rec = Record::new(Metadata::new(Level::Warn, "db"), "slow", &fields);
+let mut out = String::new();
+LogfmtFormat::new().write_record(&rec, &mut out)?;
+assert_eq!(out, "level=warn target=db message=slow path=\"/a b\" bad_key=1\n");
+# Ok::<(), core::fmt::Error>(())
 ```
 
-### `HumanFormat`
+`timestamp_rfc3339(true)` switches the timestamp from nanoseconds to
+RFC 3339.
+
+### `HumanFormat` and `ColorChoice`
+
+```text
+2026-10-13T19:03:23.894235900Z WARN  [app::db] slow query table=users ms=412
+```
+
+Options: `show_target(bool)` (the column is also omitted for an empty
+target), `show_source_location(bool)` (appends ` (file:line)`),
+`color(bool)`. Message and target are escaped but not quoted;
+backslashes are left alone, so the format is for people, not parsers.
 
 ```rust
-pub struct HumanFormat { /* opaque */ }
+use log_io::format::{ColorChoice, Format, HumanFormat};
+use log_io::{Level, Metadata, Record};
+
+let rec = Record::new(Metadata::new(Level::Error, "app"), "boom\x1b[2J", &[]);
+let mut out = String::new();
+HumanFormat::new().write_record(&rec, &mut out)?;
+assert_eq!(out, "ERROR [app] boom\\x1b[2J\n");
+
+// Colour decisions: Auto honours NO_COLOR, CLICOLOR_FORCE and TERM=dumb.
+let colored = HumanFormat::new().color(ColorChoice::Auto.enabled_for_stderr());
+assert!(ColorChoice::Always.resolve(false));
+assert!(!ColorChoice::Never.resolve(true));
+# let _ = colored;
+# Ok::<(), core::fmt::Error>(())
 ```
 
-Single-line terminal-friendly output:
+`LoggerBuilder::stdout_human` / `stderr_human` use `ColorChoice::Auto`
+for their stream. On Windows, `Auto` colours only inside terminals known
+to interpret ANSI sequences (Windows Terminal, ConEmu, or when `TERM` is
+set, as in Git Bash), because enabling virtual-terminal mode in the
+classic console requires `unsafe` FFI.
 
-```
-TIMESTAMP LEVEL [target] message key=value key=value
-```
+## Filtering
 
-Levels are upper-case and column-padded. Timestamps are RFC 3339
-when present. Available behind `feature = "human"`; works under
-`no_std`.
+### Rules and matching
 
-#### `HumanFormat::new` / `HumanFormat::default`
+A `Filter` has a default level and rules `target -> level`. A rule for
+`app::db` matches `app::db`, `app::db::pool` and `app::db.pool`, not
+`app::dbx`. The **longest** matching rule wins, so order never matters.
 
 ```rust
-pub const fn new() -> Self;
-impl Default for HumanFormat;
+use log_io::{Filter, Level};
+
+let f = Filter::new(Level::Info)
+    .with_rule("app::db", Level::Trace)
+    .with_rule("app", Level::Warn);
+assert!(f.is_enabled("app::db::pool", Level::Trace));
+assert!(!f.is_enabled("app::http", Level::Info));
+assert_eq!(f.threshold_for("other"), Level::Info);
+assert_eq!(f.min_level(), Level::Trace);
+assert_eq!(f.rules()[0].target, "app::db"); // most specific first
 ```
 
-Defaults: target shown, source location hidden.
+### Directives
 
-#### `HumanFormat::show_target`
+`Filter::parse` (also `str::parse::<Filter>()`) reads the `RUST_LOG`
+style: comma-separated segments, each a bare level (the default) or
+`target=level`. Whitespace and empty segments are ignored, level names
+are case-insensitive, and the last occurrence of a target wins. With no
+bare level the default is `off`.
 
 ```rust
-pub const fn show_target(self, enabled: bool) -> Self;
+use log_io::{Filter, Level, ParseFilterErrorKind};
+
+let f: Filter = "info, app::db=trace ,hyper=off".parse()?;
+assert_eq!(f.threshold_for("hyper::client"), Level::Off);
+
+for (bad, kind) in [
+    ("", ParseFilterErrorKind::Empty),
+    ("verbose", ParseFilterErrorKind::InvalidLevel),
+    ("=debug", ParseFilterErrorKind::EmptyTarget),
+    ("app::=debug", ParseFilterErrorKind::TrailingSeparator),
+    ("my app=debug", ParseFilterErrorKind::InvalidTarget),
+] {
+    assert_eq!(Filter::parse(bad).unwrap_err().kind(), kind);
+}
+let err = Filter::parse("info,db=loud").unwrap_err();
+assert_eq!(err.segment(), "db=loud");
+# Ok::<(), log_io::ParseFilterError>(())
 ```
 
-Toggle the `[target]` column.
+Unlike `env_logger`, a bare word must be a level (a misspelt level is
+an error rather than a target), and `/regex` message filters are not
+supported.
+
+## Logger
+
+### Building
+
+| Builder method | Default | Effect |
+|---|---|---|
+| `level(Level)` | `Info` | default threshold (rules kept) |
+| `filter(Filter)` / `target_level(t, l)` | | replace the filter / add a rule |
+| `filter_directive(&str)` | | parse a directive; invalid ones are reported by `try_build` |
+| `try_filter_directive(&str)` | | same, failing immediately |
+| `env_filter(var)` | | directive from an environment variable; unset or blank keeps the current filter |
+| `default_target(t)` | `""` | target used by `Logger::log` |
+| `no_timestamps()` / `no_context()` | on / on | skip the clock / thread context |
+| `with_default_field(k, v)` | | field on every record (same key replaces) |
+| `flush_on(Level)` | `Error` | flush every sink after records at or above it; `Off` disables |
+| `redact_key(k)` / `redact_common_secrets()` | none | replace values with `[REDACTED]` |
+| `on_error(handler)` | none | callback for sink, flush and format errors |
+| `with_sink`, `writer`, `stdout`, `stderr` | | install sinks |
+| `stdout_json`, `stderr_logfmt`, `stdout_human`, ... | | shortcuts per built-in format |
+| `build()` / `try_build()` | | finish (`build` panics without a sink) |
 
 ```rust
-use log_io::format::HumanFormat;
-let fmt = HumanFormat::new().show_target(false);
+use std::sync::Arc;
+use log_io::{BuildError, Level, Logger};
+
+let logger = Logger::builder()
+    .level(Level::Info)
+    .env_filter("LOG_IO_EXAMPLE_UNSET_VAR")
+    .with_default_field("service", "billing")
+    .redact_common_secrets()
+    .flush_on(Level::Warn)
+    .on_error(Arc::new(|e| eprintln!("logging failed: {e}")))
+    .stderr_logfmt()
+    .try_build()?;
+assert_eq!(logger.min_level(), Level::Info);
+
+assert!(matches!(Logger::builder().try_build(), Err(BuildError::NoSink)));
+# Ok::<(), BuildError>(())
 ```
 
-#### `HumanFormat::show_source_location`
+### Emitting
 
 ```rust
-pub const fn show_source_location(self, enabled: bool) -> Self;
+use log_io::{Field, Level, Logger, Metadata};
+
+let logger = Logger::builder().default_target("app").stdout_json().build();
+
+logger.log(Level::Info, "uses the default target", &[]);
+logger.try_log(Level::Warn, "app::db", "explicit target", &[Field::new("ms", 412_u64)])?;
+let meta = Metadata::new(Level::Error, "app").with_location(file!(), line!());
+logger.try_emit(meta, "with source location", &[])?;
+
+if logger.enabled("app::db", Level::Debug) {
+    // build expensive fields only when they will be used
+}
+logger.flush()?;
+# Ok::<(), log_io::Error>(())
 ```
 
-When enabled and the record carries source location, the line is
-suffixed with ` (file:line)`.
+`log` never returns errors (they go to the handler). `try_log` and
+`try_emit` return the first sink or flush error; every sink still
+receives the record.
+
+### Record assembly
+
+Ambient fields are, in increasing precedence: default fields, thread
+context, integration context (for example `tracing` span fields), and
+finally the call-site fields. Each key appears once; the highest
+precedence wins. Redaction applies to all of them and never evaluates a
+lazy value it replaces.
 
 ```rust
-use log_io::format::HumanFormat;
-let fmt = HumanFormat::new().show_source_location(true);
+use std::io::Write;
+use std::sync::{Arc, Mutex};
+use log_io::format::JsonFormat;
+use log_io::{context, Field, Level, Logger};
+
+#[derive(Clone, Default)]
+struct Buf(Arc<Mutex<Vec<u8>>>);
+impl Write for Buf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+let buf = Buf::default();
+let logger = Logger::builder()
+    .no_timestamps()
+    .with_default_field("user", "default")
+    .redact_key("password")
+    .writer(buf.clone(), JsonFormat::new())
+    .build();
+let _ctx = context::with_field("user", "from-context");
+logger.log(Level::Info, "login", &[Field::new("password", "hunter2")]);
+
+let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+assert_eq!(
+    text,
+    "{\"level\":\"info\",\"target\":\"\",\"message\":\"login\",\
+      \"user\":\"from-context\",\"password\":\"[REDACTED]\"}\n"
+);
 ```
+
+### Error handling
+
+`ErrorHandler` is `Arc<dyn Fn(&Error) + Send + Sync>`. It runs once per
+failing sink per record, and for flush and message-formatting errors.
+If the handler logs through a logger whose sink keeps failing, nested
+failures are not re-reported (no unbounded recursion).
+
+## Global logger
+
+```rust,no_run
+use log_io::{Level, Logger};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let logger = Logger::builder().level(Level::Info).stdout_json().build();
+    let _guard = log_io::init(logger)?;      // keep until the end of main
+    log_io::global::install_panic_hook();    // optional
+
+    log_io::info!("service started", port = 8080_u16);
+    if let Some(logger) = log_io::global::get() {
+        logger.log(Level::Debug, "direct access", &[]);
+    }
+    log_io::global::shutdown()?;             // e.g. before process::exit
+    std::process::exit(0);
+}
+```
+
+- `init(logger)` installs the logger and returns a `FlushGuard`;
+  `set_global(logger)` installs without a guard. Both fail with
+  `SetGlobalError` (which returns the logger) if one is installed.
+- `global::get()`, `global::flush()`, `global::shutdown()`.
+- `global::install_panic_hook()` logs each panic (target `panic`, the
+  panic message, location, thread name) and flushes, then runs the
+  previous hook. It does nothing when the panic happened inside a sink
+  on the same thread, where touching the logger could deadlock.
+
+## Durability
+
+| Situation | Buffered records |
+|---|---|
+| record at or above the flush level (default `Error`) | flushed before the call returns, with everything buffered before it |
+| `Logger::flush` / `shutdown`, `global::flush` / `shutdown` | flushed |
+| `FlushGuard` dropped (end of `main`) | flushed, background sinks drained |
+| last `Logger` clone dropped | flushed, background sinks drained |
+| return from `main` with the logger in a `static` and no guard | **lost** |
+| `std::process::exit` without `shutdown` | **lost** |
+| `panic = "abort"` without the panic hook, `abort()`, fatal signal | **lost** |
+| `panic = "abort"` with the panic hook | the panic record and everything before it are flushed |
+
+Flushing hands bytes to the operating system; that survives a crash of
+the process but not of the machine. `FileSink::builder(..).sync_on_flush(true)`
+adds `fsync` (`sync_data`) to every flush, and `buffer_capacity(0)`
+writes every record through immediately.
 
 ## Sinks
 
 ### `Sink` trait
 
-```rust
+```text
 pub trait Sink: Send + Sync {
     fn write_record(&self, record: &Record<'_>) -> Result<()>;
     fn flush(&self) -> Result<()>;
+    fn shutdown(&self) -> Result<()> { self.flush() }
 }
 ```
 
-Output stage of the pipeline. Must be safe to call concurrently.
-The trait is implemented for `Arc<S>` and `Box<S>` where `S: Sink`.
+`shutdown` is called by `Logger::shutdown`, guards, and the last logger
+drop. A sink must keep accepting records afterwards. `Arc<S>` and
+`Box<S>` forward all three methods.
 
-**Implementing a custom sink**
+### Built-in sinks
+
+| Sink | Writes to | Notes |
+|---|---|---|
+| `StdoutSink<F>` / `StderrSink<F>` | standard streams | one `write_all` per record under the stream's own lock |
+| `FileSink<F>` | a file | 8 KiB buffer by default; `builder` sets `append`, `buffer_capacity`, `sync_on_flush` |
+| `WriterSink<W, F>` | any `io::Write + Send` | `with_writer` gives locked access; `into_inner` returns the writer |
+| `RotatingFileSink<F>` | `WriterSink<RotatingFile, F>` | see below |
+| `NonBlocking<F>` | any `io::Write + Send`, on a thread | see below |
+| `NullSink` | nowhere | does not format |
+
+Built-in sinks recover from mutex poisoning and format outside their
+lock.
+
+### `RotatingFile`
+
+```rust,no_run
+use log_io::format::JsonFormat;
+use log_io::sink::{RotatingFile, Rotation};
+use log_io::Logger;
+
+let file = RotatingFile::builder("logs/app.jsonl")
+    .max_bytes(50 * 1024 * 1024) // rotate before exceeding 50 MiB
+    .rotation(Rotation::Daily)   // and at 00:00 UTC
+    .max_files(14)               // keep app.jsonl.1 ..= app.jsonl.14
+    .open()?;
+let logger = Logger::builder().writer(file, JsonFormat::new()).build();
+# let _ = logger;
+# Ok::<(), std::io::Error>(())
+```
+
+Rotation renames `app.jsonl` to `app.jsonl.1` (shifting older files up)
+between records, never inside one. The handle is closed before renaming,
+which makes it work on Windows. If a rename fails (another process
+holding the file open without delete sharing), the writer keeps
+appending to the current file, retries later, and reports the error from
+the next `flush`. Records are never lost to a failed rotation.
+`Rotation::{Never, Minutely, Hourly, Daily}`; periods are UTC.
+
+### `NonBlocking`
+
+```rust
+use log_io::format::JsonFormat;
+use log_io::sink::{NonBlocking, Overflow};
+use log_io::Logger;
+
+let sink = NonBlocking::builder(std::io::sink(), JsonFormat::new())
+    .capacity(8192)                 // queued records
+    .overflow(Overflow::DropNewest) // or Overflow::Block (default, lossless)
+    .buffer_capacity(64 * 1024)     // worker's write buffer
+    .build()?;
+let logger = Logger::builder().with_sink(sink).build();
+log_io::info!(logger, "formatted here, written on the worker thread");
+logger.shutdown()?; // drains the queue and joins the worker
+# Ok::<(), log_io::Error>(())
+```
+
+- Records are formatted on the calling thread and written by a
+  background thread, which flushes whenever its queue drains.
+- `flush` waits until everything queued before it is written.
+- After `shutdown`, records are written synchronously, so late records
+  from other threads are kept.
+- Worker write errors are counted (`write_errors()`), passed to the
+  builder's `on_error` handler on the worker thread, and returned by the
+  next `flush`. Drops under `DropNewest` are counted (`dropped()`).
+- Queued strings are recycled, so a single producer does not allocate
+  in steady state; under heavy contention some records allocate.
+
+### Writing a sink
 
 ```rust
 use std::sync::Mutex;
-use log_io::{Record, Result, Sink};
+use log_io::format::{Format, LogfmtFormat};
+use log_io::{Logger, Record, Result, Sink};
 
-struct InMemorySink {
-    lines: Mutex<Vec<String>>,
-}
+#[derive(Default)]
+struct Lines(Mutex<Vec<String>>);
 
-impl Sink for InMemorySink {
+impl Sink for Lines {
     fn write_record(&self, record: &Record<'_>) -> Result<()> {
-        self.lines.lock().unwrap().push(record.message.to_owned());
+        let mut line = String::new();
+        LogfmtFormat::new().write_record_generic(record, &mut line)?;
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).push(line);
         Ok(())
     }
-    fn flush(&self) -> Result<()> {
-        Ok(())
-    }
+    fn flush(&self) -> Result<()> { Ok(()) }
 }
+
+let sink = std::sync::Arc::new(Lines::default());
+let logger = Logger::builder().no_timestamps().with_sink(sink.clone()).build();
+log_io::info!(logger, "captured");
+assert_eq!(sink.0.lock().unwrap().len(), 1);
 ```
 
-### `StdoutSink`
+## Context
+
+Thread-local key-value pairs attached to every record from the thread.
 
 ```rust
-pub struct StdoutSink<F: Format> { /* opaque */ }
+use log_io::{context, Value};
 
-impl<F: Format> StdoutSink<F> {
-    pub fn new(format: F) -> Self;
-}
-```
-
-Writes serialized records to `io::stdout()` under a sink-local
-mutex.
-
-```rust
-use log_io::format::JsonFormat;
-use log_io::sink::StdoutSink;
-let sink = StdoutSink::new(JsonFormat::new());
-```
-
-### `StderrSink`
-
-```rust
-pub struct StderrSink<F: Format> { /* opaque */ }
-
-impl<F: Format> StderrSink<F> {
-    pub fn new(format: F) -> Self;
-}
-```
-
-Identical to [`StdoutSink`] but writes to standard error.
-
-### `FileSink`
-
-```rust
-pub struct FileSink<F: Format> { /* opaque */ }
-
-impl<F: Format> FileSink<F> {
-    pub fn append<P: AsRef<Path>>(path: P, format: F) -> Result<Self>;
-    pub fn create<P: AsRef<Path>>(path: P, format: F) -> Result<Self>;
-}
-```
-
-`BufWriter<File>` wrapped in a mutex. `Sink::flush` flushes the
-buffer to the OS but does not call `fsync`; use the file directly
-if you need stricter durability.
-
-`append` opens the file for append (creating if needed); `create`
-truncates an existing file.
-
-```rust
-use log_io::format::JsonFormat;
-use log_io::sink::FileSink;
-
-let sink = FileSink::append("app.log", JsonFormat::new())?;
-# Ok::<(), log_io::Error>(())
-```
-
-### `WriterSink`
-
-```rust
-pub struct WriterSink<W: Write + Send, F: Format> { /* opaque */ }
-
-impl<W: Write + Send, F: Format> WriterSink<W, F> {
-    pub fn new(writer: W, format: F) -> Self;
-}
-```
-
-Adapter for any `Send + Write` value: in-memory buffers, sockets,
-channel-backed writers, etc. Useful in tests for capturing output.
-
-```rust
-use log_io::format::JsonFormat;
-use log_io::sink::WriterSink;
-let buf: Vec<u8> = Vec::new();
-let sink = WriterSink::new(buf, JsonFormat::new());
-```
-
-### `NullSink`
-
-```rust
-pub struct NullSink;
-
-impl NullSink {
-    pub const fn new() -> Self;
-}
-```
-
-Discards every record. Used in benchmarks and tests.
-
-## Errors
-
-### `Error`
-
-```rust
-pub enum Error {
-    Io(io::Error),
-    Format(fmt::Error),
-    Configuration(&'static str),
-}
-```
-
-Errors produced by the logging pipeline.
-
-`From<io::Error>` and `From<fmt::Error>` are implemented. `Display`
-and `std::error::Error` are implemented; `Error::source` returns
-the underlying error for `Io` and `Format`.
-
-### `Result`
-
-```rust
-pub type Result<T> = core::result::Result<T, Error>;
-```
-
-Crate-wide result alias.
-
-## Logger
-
-### `Logger`
-
-```rust
-pub struct Logger { /* opaque, cheap to clone */ }
-```
-
-The configured pipeline. Cloning a `Logger` shares the underlying
-filter and sinks via `Arc`.
-
-#### `Logger::builder`
-
-```rust
-pub fn builder() -> LoggerBuilder;
-```
-
-Start configuring a logger. See [`LoggerBuilder`](#loggerbuilder).
-
-#### `Logger::log`
-
-```rust
-pub fn log(&self, level: Level, message: &str, fields: &[Field<'_>]);
-```
-
-Emit a record using the empty string as the target. Errors are
-silently swallowed; use [`Logger::try_log`] or
-[`LoggerBuilder::on_error`] to surface them.
-
-**Parameters**
-
-| Name      | Type            | Description                                  |
-|-----------|-----------------|----------------------------------------------|
-| `level`   | `Level`         | Record severity.                             |
-| `message` | `&str`          | Free-form message.                           |
-| `fields`  | `&[Field<'_>]`  | Structured fields. May be empty.             |
-
-```rust
-use log_io::{Field, Level, Logger};
-let logger = Logger::builder().level(Level::Info).stdout_human().build();
-logger.log(Level::Info, "ok", &[Field::new("port", 80_u32)]);
-```
-
-#### `Logger::try_log`
-
-```rust
-pub fn try_log(
-    &self,
-    level: Level,
-    target: &str,
-    message: &str,
-    fields: &[Field<'_>],
-) -> Result<()>;
-```
-
-Emit a record with explicit `target`. The first sink error is
-returned; every sink still receives the record.
-
-```rust
-use log_io::{Field, Level, Logger};
-let logger = Logger::builder().level(Level::Info).stdout_json().build();
-logger.try_log(Level::Info, "app::auth", "login ok", &[Field::new("user", 42_u64)])?;
-# Ok::<(), log_io::Error>(())
-```
-
-#### `Logger::try_emit`
-
-```rust
-pub fn try_emit(
-    &self,
-    metadata: Metadata<'_>,
-    message: &str,
-    fields: &[Field<'_>],
-) -> Result<()>;
-```
-
-Lowest-level entry point. Accepts a pre-built `Metadata` so callers
-(typically the macros) can attach source location.
-
-```rust
-use log_io::{Level, Logger, Metadata};
-let logger = Logger::builder().level(Level::Info).stdout_json().build();
-let m = Metadata::new(Level::Info, "app").with_location(file!(), line!());
-logger.try_emit(m, "manual", &[])?;
-# Ok::<(), log_io::Error>(())
-```
-
-#### `Logger::enabled`
-
-```rust
-pub fn enabled(&self, target: &str, level: Level) -> bool;
-```
-
-Returns `true` if a record at `level`/`target` would pass the
-filter. Use in hot paths to skip field construction.
-
-```rust
-use log_io::{Field, Level, Logger};
-let logger = Logger::builder().level(Level::Info).stdout_json().build();
-if logger.enabled("app", Level::Debug) {
-    let computed = expensive_diagnostic();
-    logger.log(Level::Debug, "report", &[Field::new("data", computed.as_str())]);
-}
-# fn expensive_diagnostic() -> String { String::new() }
-```
-
-#### `Logger::threshold_for`
-
-```rust
-pub fn threshold_for(&self, target: &str) -> Level;
-```
-
-The effective filter threshold for `target`.
-
-#### `Logger::min_level`
-
-```rust
-pub fn min_level(&self) -> Level;
-```
-
-The lowest severity admitted by the filter anywhere. Useful for
-macros to short-circuit at compile time or call site.
-
-#### `Logger::sink_count`
-
-```rust
-pub fn sink_count(&self) -> usize;
-```
-
-Number of installed sinks. Diagnostic accessor.
-
-#### `Logger::flush`
-
-```rust
-pub fn flush(&self) -> Result<()>;
-```
-
-Flush every installed sink. The first error is surfaced; every
-sink is still attempted.
-
-```rust
-use log_io::{Level, Logger};
-let logger = Logger::builder().level(Level::Info).stdout_json().build();
-// ... log records ...
-logger.flush()?;
-# Ok::<(), log_io::Error>(())
-```
-
-### `LoggerBuilder`
-
-```rust
-pub struct LoggerBuilder { /* opaque */ }
-```
-
-Fluent builder. Construct with [`Logger::builder`]. Every method
-returns `Self` so calls chain.
-
-#### `LoggerBuilder::level`
-
-```rust
-pub fn level(self, level: Level) -> Self;
-```
-
-Set the default minimum severity. Existing rules are preserved.
-
-```rust
-use log_io::{Level, Logger};
-let logger = Logger::builder().level(Level::Warn).stdout_json().build();
-```
-
-#### `LoggerBuilder::filter`
-
-```rust
-pub fn filter(self, filter: Filter) -> Self;
-```
-
-Replace the filter wholesale.
-
-```rust
-use log_io::{Filter, Level, Logger};
-let f = Filter::new(Level::Info).with_rule("app::auth", Level::Debug);
-let logger = Logger::builder().filter(f).stdout_json().build();
-```
-
-#### `LoggerBuilder::target_level`
-
-```rust
-pub fn target_level(self, target: impl Into<String>, level: Level) -> Self;
-```
-
-Add a per-target filter override.
-
-```rust
-use log_io::{Level, Logger};
-let logger = Logger::builder()
-    .level(Level::Warn)
-    .target_level("app::auth", Level::Debug)
-    .target_level("hyper", Level::Off)
-    .stdout_json()
-    .build();
-```
-
-#### `LoggerBuilder::filter_directive`
-
-```rust
-pub fn filter_directive(self, directive: &str) -> Self;
-```
-
-Parse `directive` and replace the filter. Silently retains the
-previous filter on parse error; use [`Filter::parse`] up front for
-explicit handling.
-
-```rust
-use log_io::Logger;
-let logger = Logger::builder()
-    .filter_directive("warn, app::auth=debug, hyper=off")
-    .stdout_json()
-    .build();
-```
-
-#### `LoggerBuilder::no_timestamps`
-
-```rust
-pub fn no_timestamps(self) -> Self;
-```
-
-Disable automatic timestamp capture. Records still carry whatever
-timestamp the caller sets on `Metadata`.
-
-#### `LoggerBuilder::no_context`
-
-```rust
-pub fn no_context(self) -> Self;
-```
-
-Disable thread-local context capture.
-
-#### `LoggerBuilder::with_default_field`
-
-```rust
-pub fn with_default_field<'a, V: Into<Value<'a>>>(
-    self,
-    key: impl Into<String>,
-    value: V,
-) -> Self;
-```
-
-Attach a field that the logger emits on every record. Typical use:
-service / version / region identifiers.
-
-```rust
-use log_io::Logger;
-let logger = Logger::builder()
-    .with_default_field("service", "billing")
-    .with_default_field("version", env!("CARGO_PKG_VERSION"))
-    .with_default_field("env", "production")
-    .stdout_json()
-    .build();
-```
-
-#### `LoggerBuilder::on_error`
-
-```rust
-pub fn on_error(self, handler: ErrorHandler) -> Self;
-```
-
-Install a callback invoked when any sink returns an error. See
-[`ErrorHandler`](#errorhandler).
-
-```rust
-use std::sync::Arc;
-use log_io::Logger;
-let logger = Logger::builder()
-    .on_error(Arc::new(|e| eprintln!("log_io sink error: {e}")))
-    .stdout_json()
-    .build();
-```
-
-#### `LoggerBuilder::with_sink`
-
-```rust
-pub fn with_sink(self, sink: impl Sink + 'static) -> Self;
-```
-
-Install a pre-built sink. Use this when the sink is fallible to
-construct (typical for [`FileSink`]) or when implementing a custom
-[`Sink`].
-
-```rust
-use log_io::format::JsonFormat;
-use log_io::sink::FileSink;
-use log_io::Logger;
-
-let sink = FileSink::append("app.log", JsonFormat::new())?;
-let logger = Logger::builder().with_sink(sink).build();
-# Ok::<(), log_io::Error>(())
-```
-
-#### `LoggerBuilder::stdout` / `stderr` / `writer`
-
-```rust
-pub fn stdout<F: Format + Send + Sync + 'static>(self, format: F) -> Self;
-pub fn stderr<F: Format + Send + Sync + 'static>(self, format: F) -> Self;
-pub fn writer<W, F>(self, writer: W, format: F) -> Self
-where
-    W: Write + Send + 'static,
-    F: Format + Send + Sync + 'static;
-```
-
-Convenience constructors that wrap the destination + format and
-install the resulting sink. Each adds one sink to the fanout.
-
-```rust
-use log_io::format::JsonFormat;
-use log_io::Logger;
-let logger = Logger::builder().stdout(JsonFormat::new().pretty(true)).build();
-```
-
-```rust
-use log_io::format::JsonFormat;
-use log_io::Logger;
-let buf: Vec<u8> = Vec::new();
-let logger = Logger::builder().writer(buf, JsonFormat::new()).build();
-```
-
-#### Format shortcuts
-
-```rust
-// feature = "json"
-pub fn stdout_json(self) -> Self;
-pub fn stderr_json(self) -> Self;
-
-// feature = "logfmt"
-pub fn stdout_logfmt(self) -> Self;
-pub fn stderr_logfmt(self) -> Self;
-
-// feature = "human"
-pub fn stdout_human(self) -> Self;
-pub fn stderr_human(self) -> Self;
-```
-
-Shorter forms for the common case. Each installs a sink wired to
-the default configuration of the named format.
-
-```rust
-use log_io::Logger;
-let logger = Logger::builder().stdout_json().build();
-```
-
-#### `LoggerBuilder::build`
-
-```rust
-pub fn build(self) -> Logger;
-```
-
-Finalize and return a usable [`Logger`].
-
-**Panics** if no sink has been installed; a logger with zero sinks
-is almost certainly a programmer error.
-
-```rust
-use log_io::Logger;
-let logger = Logger::builder()
-    .stdout_json()
-    .build();
-```
-
-### `ErrorHandler`
-
-```rust
-pub type ErrorHandler = Arc<dyn Fn(&Error) + Send + Sync>;
-```
-
-Callback installed by [`LoggerBuilder::on_error`]. Invoked once per
-sink error.
-
-```rust
-use std::sync::Arc;
-use log_io::{ErrorHandler, Logger};
-
-let handler: ErrorHandler = Arc::new(|err| {
-    eprintln!("log sink failure: {err}");
-});
-let logger = Logger::builder().on_error(handler).stdout_json().build();
-```
-
-## Context propagation
-
-The `context` module provides per-thread ambient fields that are
-automatically attached to every record emitted on the thread.
-
-### Constants
-
-```rust
-pub const MAX_CONTEXT_SLOTS: usize = 16;
-```
-
-Upper bound on the number of fields stored per thread. When
-exceeded, the oldest slot is evicted on insertion.
-
-### `with_field`
-
-```rust
-pub fn with_field<'a, V: Into<Value<'a>>>(key: &str, value: V) -> ContextGuard;
-```
-
-Push a key/value pair onto the current thread's context. Returns a
-guard; the value is removed when the guard drops.
-
-```rust
-use log_io::{context, Level, Logger, Value};
-
-let logger = Logger::builder().level(Level::Info).stdout_json().build();
 {
-    let _g = context::with_field("user_id", Value::U64(42));
-    log_io::info!(logger, "served"); // record carries user_id=42
+    let _trace = context::with_trace_id("tx-1");
+    let _user = context::with_field("user", 42_u64);
+    let _inner = context::with_field("user", 43_u64); // shadows the outer user
+    assert_eq!(context::len(), 2);
+    context::with_snapshot(|fields| {
+        assert_eq!(fields[1].value, Value::U64(43));
+    });
 }
+assert_eq!(context::len(), 0);
 ```
 
-### `with_trace_id` / `with_request_id`
+- `with_field`, `with_trace_id`, `with_request_id` return a
+  `ContextGuard`; dropping it removes the entry. Guards may be dropped
+  in any order. Pushing a value allocates; attaching context to a record
+  does not.
+- At most `MAX_CONTEXT_SLOTS` (16) entries per thread and fields per
+  record; the oldest entries are evicted.
+- Changes made from inside a sink or format apply when the current
+  dispatch ends. Guards dropped during thread teardown do nothing.
+- `ContextGuard` is `!Send` / `!Sync`, which turns "guard held across
+  `.await` in a multi-threaded executor" into a compile error:
+
+```compile_fail
+let guard = log_io::context::with_field("tenant", "a");
+std::thread::spawn(move || drop(guard));
+```
+
+### Snapshots for threads and tasks
 
 ```rust
-pub fn with_trace_id(id: &str) -> ContextGuard;
-pub fn with_request_id(id: &str) -> ContextGuard;
+use log_io::context::{self, ContextSnapshot};
+use log_io::Field;
+
+let snapshot = {
+    let _req = context::with_request_id("req-7");
+    context::capture() // owned, Send + Sync, cheap to clone
+};
+
+std::thread::spawn({
+    let snapshot = snapshot.clone();
+    move || snapshot.scope(|| assert_eq!(context::len(), 1))
+})
+.join()
+.unwrap();
+
+let _attached = snapshot.attach(); // until the guard drops
+let explicit = ContextSnapshot::from_fields(&[Field::new("tenant", "acme")]);
+let future = explicit.wrap(async { /* every poll sees tenant=acme */ });
+# drop(future);
 ```
 
-Convenience wrappers for the most common keys.
-
-```rust
-use log_io::{context, Level, Logger};
-
-let logger = Logger::builder().level(Level::Info).stdout_json().build();
-let _t = context::with_trace_id("tx-7f3a");
-let _r = context::with_request_id("req-001");
-log_io::info!(logger, "served"); // record carries both
-```
-
-### `with_snapshot`
-
-```rust
-pub fn with_snapshot<R>(f: impl FnOnce(&[Field<'_>]) -> R) -> R;
-```
-
-Run `f` with the current thread's context exposed as a borrowed
-slice of [`Field`]. Zero-allocation; reentrancy-safe (a re-entered
-call sees an empty slice rather than panicking).
-
-```rust
-use log_io::context;
-context::with_snapshot(|fields| {
-    for f in fields {
-        println!("{} = {:?}", f.key, f.value);
-    }
-});
-```
-
-### `clear`
-
-```rust
-pub fn clear();
-```
-
-Remove every context entry on the current thread. Intended for
-tests; production code should rely on `ContextGuard` drop.
-
-### `len`
-
-```rust
-pub fn len() -> usize;
-```
-
-Number of context entries on the current thread.
-
-### `ContextGuard`
-
-```rust
-pub struct ContextGuard { /* opaque */ }
-```
-
-RAII guard returned by `with_field` and friends. Removes the
-associated slot on drop. Guards may be dropped in any order.
+`ContextSnapshot::wrap` re-installs the snapshot around every poll, so
+it works with any executor, including work-stealing ones. It boxes the
+future once.
 
 ## Macros
 
-Each macro takes a `Logger` expression and produces a log call.
-Fields use a `key = expr` syntax; the expression must produce a
-value convertible to [`Value`]. Source location (`file!()`,
-`line!()`) and module path (`module_path!()`) are captured
-automatically.
-
-### `log_at!`
-
-```rust
-log_io::log_at!(logger, Level::Info, "msg" [, key = value]*);
+```text
+info!(LOGGER, [target: EXPR,] "format string" [, ARG]* [, KEY = VALUE]* [,])
+info!([target: EXPR,] "format string" ...)        // global logger
+info!(LOGGER, &str_expression [, KEY = VALUE]*)   // non-literal message
+log_at!(LOGGER, LEVEL, ...)  /  log_at!(LEVEL, "...")
 ```
 
-General form. The other level macros forward to this one.
-
-```rust
-use log_io::{Level, Logger};
-let logger = Logger::builder().level(Level::Trace).stdout_json().build();
-log_io::log_at!(logger, Level::Info, "boot", port = 8080_u32);
-```
-
-### `trace!` / `debug!` / `info!` / `warn!` / `error!`
-
-```rust
-log_io::trace!(logger, "msg" [, key = value]*);
-log_io::debug!(logger, "msg" [, key = value]*);
-log_io::info!(logger,  "msg" [, key = value]*);
-log_io::warn!(logger,  "msg" [, key = value]*);
-log_io::error!(logger, "msg" [, key = value]*);
-```
-
-Level-specific shortcuts.
+`trace!`, `debug!`, `info!`, `warn!`, `error!` and `log_at!` share the
+syntax. Keys are identifiers, dotted paths, or string literals. Values
+go through `Value::from`; `%v` records `v` via `Display` and `?v` via
+`Debug`, lazily. The filter is checked once, before any argument is
+evaluated; the target defaults to `module_path!()` and the source
+location is always attached.
 
 ```rust
 use log_io::{Level, Logger};
-let logger = Logger::builder().level(Level::Trace).stdout_json().build();
-log_io::info!(logger, "request handled", path = "/api", duration_ms = 12_u64);
-log_io::warn!(logger, "slow query", query_ms = 1280_u64);
-log_io::error!(logger, "shutdown", signal = "SIGTERM", graceful = true);
+
+let logger = Logger::builder().level(Level::Debug).stdout_logfmt().build();
+let user = "alice";
+let peer = std::net::Ipv4Addr::LOCALHOST;
+let roles = ["admin"];
+
+log_io::info!(logger, "user {user} logged in from {}", peer, session = 7_u64);
+log_io::debug!(logger, "request", http.method = "GET", "content-type" = "text/html",
+    peer = %peer, roles = ?roles);
+log_io::warn!(logger, target: "billing", "braces are escaped: {{}}");
+log_io::log_at!(logger, Level::Error, "runtime-chosen level");
+let owned = String::from("not a format string {}");
+log_io::trace!(logger, owned.as_str()); // filtered out at Debug, never formatted
 ```
 
-## `no_std` support
+Named format arguments (`"{x}", x = 1`) are not available because
+`name = value` always means a field; use inline captures or positional
+arguments.
 
-With `default-features = false`, `log-io` compiles in `no_std`
-mode. The available surface is:
+## Integrations: `log` and `tracing`
 
-- `Level`, `ParseLevelError`
-- `Value`, `Field`, `Metadata`, `Record`
-- `Format` trait
-- `JsonFormat`, `LogfmtFormat`, `HumanFormat` (each behind its
-  feature flag)
+### `compat::LogBridge` (feature `log`)
 
-Not available: `Logger`, sinks, `Filter`, context, std-backed
-timestamps. Embedded callers typically wire a custom formatter into
-a UART-backed `core::fmt::Write` destination and produce
-timestamps themselves via `Metadata::with_timestamp`.
+```rust
+use log_io::compat::LogBridge;
+use log_io::{Level, Logger};
 
-```toml
-[dependencies]
-log-io = { version = "1", default-features = false, features = ["json"] }
+let logger = Logger::builder().level(Level::Info).stdout_logfmt().build();
+let _guard = logger.flush_guard();
+LogBridge::new(logger).install().ok(); // also sets log::max_level
+
+log::info!(user = "alice", attempts = 3; "login");
 ```
 
-```rust,no_run
-#![no_std]
+Levels, target, file and line are preserved; key-values keep their
+primitive types (strings, integers, floats, booleans, chars) and other
+values are rendered with `Display` when written. No allocation for up
+to 16 key-values.
 
-use log_io::format::{Format, JsonFormat};
+### `compat::TracingLayer` (feature `tracing`)
+
+```rust
+use log_io::compat::TracingLayer;
+use log_io::Logger;
+use tracing_subscriber::layer::SubscriberExt;
+
+let logger = Logger::builder().stdout_json().build();
+let subscriber = tracing_subscriber::registry().with(TracingLayer::new(logger));
+tracing::subscriber::with_default(subscriber, || {
+    let span = tracing::info_span!("request", id = 7_u64);
+    let _entered = span.enter();
+    tracing::info!(status = 200_u16, "handled"); // carries id=7
+});
+```
+
+The `message` field becomes the record message; other event fields
+become fields; enclosing spans' fields (root first, inner shadowing
+outer) become context. The logger's filter is applied per event; the
+layer does not implement `Layer::enabled`, because returning `false`
+there would also disable the event for other layers. Your application
+needs `tracing-subscriber`'s `registry` feature.
+
+## Errors
+
+`Error` (`#[non_exhaustive]`): `Io(io::Error)`, `Format(fmt::Error)`,
+`Configuration(&'static str)`, `Closed`, `Custom(Box<dyn Error + Send +
+Sync>)` (build with `Error::custom`). `Result<T>` is
+`core::result::Result<T, Error>`.
+
+| Error | Returned by | Meaning |
+|---|---|---|
+| `Error` | `try_log`, `try_emit`, `flush`, `shutdown`, sinks | sink, flush or format failure |
+| `BuildError` (`NoSink`, `InvalidFilter`) | `LoggerBuilder::try_build` | configuration problem |
+| `ParseFilterError` (`kind()`, `segment()`) | `Filter::parse`, `try_filter_directive` | malformed directive |
+| `ParseLevelError` | `Level::from_str` | unknown level name |
+| `SetGlobalError` (`into_inner()`) | `init`, `set_global` | a global logger is already installed |
+
+## Threading, async and allocation
+
+- `Logger` and all sinks are `Send + Sync`; `Logger` is also
+  `UnwindSafe` / `RefUnwindSafe` (its state survives panics).
+- Synchronous sinks block the calling thread for the write. In async
+  code, prefer `NonBlocking` for files and sockets.
+- Context is per thread; use `ContextSnapshot::wrap` for futures.
+- Steady-state emission through the synchronous sinks does not allocate
+  (timestamps, context, defaults, dedup, redaction, `format!` messages,
+  and the `log` / `tracing` bridges included) while each group of fields
+  stays within 16 entries. `tests/alloc.rs` enforces this.
+- Per-thread buffers are trimmed back to 64 KiB after an oversized
+  record.
+
+## `no_std`
+
+With `default-features = false` and any of `json`, `logfmt`, `human`,
+the data model and formatters work without `std` or `alloc`, writing to
+any `core::fmt::Write`. Supply the timestamp yourself.
+
+```rust
+// Works unchanged in a no_std crate.
+use core::fmt::Write;
+use log_io::format::{Format, LogfmtFormat};
 use log_io::{Field, Level, Metadata, Record};
 
-# struct Uart;
-# impl core::fmt::Write for Uart { fn write_str(&mut self, _: &str) -> core::fmt::Result { Ok(()) } }
-# let mut uart = Uart;
-# let now_ns = 0_u128;
-let fmt = JsonFormat::new();
-let fields = [Field::new("temp_c", 23.5_f64)];
-let meta = Metadata::new(Level::Info, "sensor").with_timestamp(now_ns);
-let record = Record::new(meta, "tick", &fields);
-fmt.write_record(&record, &mut uart).unwrap();
+fn emit(uart: &mut impl Write, now_ns: u128) -> core::fmt::Result {
+    let fields = [Field::new("temp_c", 21_i8)];
+    let meta = Metadata::new(Level::Info, "sensor").with_timestamp(now_ns);
+    let record = Record::new(meta, "reading", &fields);
+    LogfmtFormat::new().write_record_generic(&record, uart)
+}
+
+let mut out = String::new();
+emit(&mut out, 0)?;
+assert_eq!(out, "timestamp=0 level=info target=sensor message=reading temp_c=21
+");
+# Ok::<(), core::fmt::Error>(())
 ```
 
 ## Copyright
 
-Copyright (C) 2026 James Gober. Licensed under Apache-2.0.
+Copyright (C) 2026 James Gober. Licensed under the Apache License,
+Version 2.0.

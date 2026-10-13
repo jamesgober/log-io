@@ -17,7 +17,8 @@ use crate::record::Record;
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "logfmt"), doc = "```")]
+#[cfg_attr(not(all(feature = "logfmt")), doc = "```ignore")]
 /// use log_io::format::LogfmtFormat;
 /// use log_io::sink::WriterSink;
 /// use log_io::{Level, Logger};
@@ -45,7 +46,8 @@ impl<W: Write + Send, F: Format> WriterSink<W, F> {
     ///
     /// # Examples
     ///
-    /// ```
+    #[cfg_attr(all(feature = "logfmt"), doc = "```")]
+    #[cfg_attr(not(all(feature = "logfmt")), doc = "```ignore")]
     /// use log_io::format::LogfmtFormat;
     /// use log_io::sink::WriterSink;
     /// use log_io::{Level, Metadata, Record, Sink};

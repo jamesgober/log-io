@@ -24,7 +24,8 @@ use crate::value::{Value, write_hex};
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "json"), doc = "```")]
+#[cfg_attr(not(all(feature = "json")), doc = "```ignore")]
 /// use log_io::format::{Format, JsonFormat};
 /// use log_io::{Field, Level, Metadata, Record, Value};
 ///

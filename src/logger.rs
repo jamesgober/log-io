@@ -30,7 +30,8 @@ use crate::builder::LoggerBuilder;
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "logfmt"), doc = "```")]
+#[cfg_attr(not(all(feature = "logfmt")), doc = "```ignore")]
 /// use std::sync::Arc;
 /// use log_io::{ErrorHandler, Logger};
 ///
@@ -79,7 +80,8 @@ pub const REDACTED: &str = "[REDACTED]";
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "json"), doc = "```")]
+#[cfg_attr(not(all(feature = "json")), doc = "```ignore")]
 /// use log_io::{Field, Level, Logger};
 ///
 /// let logger = Logger::builder()

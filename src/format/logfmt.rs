@@ -25,7 +25,8 @@ use crate::value::{Value, write_f64, write_hex};
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "logfmt"), doc = "```")]
+#[cfg_attr(not(all(feature = "logfmt")), doc = "```ignore")]
 /// use log_io::format::{Format, LogfmtFormat};
 /// use log_io::{Field, Level, Metadata, Record};
 ///

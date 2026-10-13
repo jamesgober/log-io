@@ -84,7 +84,8 @@ struct Channel {
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "json"), doc = "```")]
+#[cfg_attr(not(all(feature = "json")), doc = "```ignore")]
 /// use log_io::format::JsonFormat;
 /// use log_io::sink::{NonBlocking, Overflow};
 /// use log_io::{Level, Logger};

@@ -42,7 +42,8 @@ use crate::value::{OwnedField, Value, write_error_chain, write_hex};
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "json", feature = "tracing"), doc = "```")]
+#[cfg_attr(not(all(feature = "json", feature = "tracing")), doc = "```ignore")]
 /// use log_io::compat::TracingLayer;
 /// use log_io::{Level, Logger};
 /// use tracing_subscriber::layer::SubscriberExt;

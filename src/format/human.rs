@@ -41,7 +41,8 @@ use crate::value::{Value, write_f64, write_hex};
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "human"), doc = "```")]
+#[cfg_attr(not(all(feature = "human")), doc = "```ignore")]
 /// use log_io::format::{Format, HumanFormat};
 /// use log_io::{Field, Level, Metadata, Record};
 ///
@@ -241,7 +242,8 @@ fn write_value<W: fmt::Write + ?Sized>(w: &mut W, v: Value<'_>) -> fmt::Result {
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "human"), doc = "```")]
+#[cfg_attr(not(all(feature = "human")), doc = "```ignore")]
 /// use log_io::format::{ColorChoice, HumanFormat};
 ///
 /// let fmt = HumanFormat::new().color(ColorChoice::Auto.enabled_for_stderr());

@@ -65,7 +65,8 @@ impl Rotation {
 ///
 /// # Examples
 ///
-/// ```no_run
+#[cfg_attr(all(feature = "json"), doc = "```no_run")]
+#[cfg_attr(not(all(feature = "json")), doc = "```ignore")]
 /// use log_io::format::JsonFormat;
 /// use log_io::sink::{RotatingFile, Rotation};
 /// use log_io::{Level, Logger};

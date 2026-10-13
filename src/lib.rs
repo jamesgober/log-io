@@ -2,7 +2,7 @@
 //!
 //! `log-io` moves structured log records through three stages: a
 //! [`Filter`] decides whether a record is wanted, a
-//! [`Format`](format::Format) serializes it (JSON, logfmt, or a
+//! [`Format`] serializes it (JSON, logfmt, or a
 //! human-readable line), and one or more [`Sink`]s deliver the bytes.
 //! The steady-state hot path performs no heap allocation, the data
 //! model and formatters work under `no_std`, and the default build has
@@ -94,6 +94,20 @@
 #![deny(clippy::unreachable)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+// The crate docs link to items behind every feature flag. Those links
+// can only resolve when all features are enabled (as on docs.rs and in
+// the CI docs job, which keep this lint at `deny`).
+#![cfg_attr(
+    not(all(
+        feature = "std",
+        feature = "json",
+        feature = "logfmt",
+        feature = "human",
+        feature = "log",
+        feature = "tracing"
+    )),
+    allow(rustdoc::broken_intra_doc_links)
+)]
 
 /// Crate version string, populated by Cargo at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -148,3 +162,22 @@ pub use crate::sink::Sink;
 #[cfg(feature = "std")]
 #[doc(hidden)]
 pub use crate::macros::__private;
+
+// Compile and run every Rust code block in the README and the API
+// reference as doctests, so the documentation cannot drift from the
+// code. Needs every feature because the examples cover all of them.
+#[cfg(all(
+    doctest,
+    feature = "std",
+    feature = "json",
+    feature = "logfmt",
+    feature = "human",
+    feature = "log",
+    feature = "tracing"
+))]
+mod external_doc_examples {
+    #[doc = include_str!("../docs/API.md")]
+    mod api_md {}
+    #[doc = include_str!("../README.md")]
+    mod readme_md {}
+}

@@ -1,90 +1,113 @@
 # log-io Benchmarks
 
-> Numbers below are indicative, not contractual. Rerun with
-> `cargo bench` on your target hardware. Hardware: developer laptop
-> (Windows, x86_64, release build with `lto = "thin"`).
+> Numbers are indicative, not contractual. They depend on the CPU, the
+> OS scheduler and background load. Re-run them on your hardware with
+> `cargo bench --all-features`.
 
-## Methodology
+## Machine and toolchain
 
-All benches are hand-rolled (no Criterion) to keep the crate
-dependency-free. Each timing reports the mean over 200,000 iterations
-after a 1,000-iteration warm-up.
+- **CPU:** AMD Ryzen 9 9950X3D (16 cores / 32 threads), 128 GB RAM
+- **OS:** Windows 11 Pro (10.0.26200), x86_64-pc-windows-msvc
+- **Toolchain:** rustc 1.95.0, release profile with `lto = "thin"`
+- **Date:** 2026-10-13
+- **Load:** the machine was shared with other build jobs while these
+  numbers were taken (17-53% CPU load). Treat single-digit percentage
+  differences as noise.
 
-* `format` bench: serializes one record into a reusable `String` buffer.
-  Measures formatter cost alone.
-* `pipeline` bench: full `Logger::log` call. Includes filter check,
-  thread-local context snapshot, dispatch, format, and write.
-* `concurrent` bench: N threads logging into a shared logger backed
-  by a discarding writer.
+## Method
 
-## Format-only (ns / record, 5 fields)
+Two independent measurements.
 
-| Format | ns/record |
-|--------|----------:|
-| JSON   | 131       |
-| logfmt | 159       |
-| human  | 210       |
-| JSON, no fields | 12 |
+1. **Criterion** (`benches/*.rs`, criterion 0.7): 100 samples per case
+   after a 3-second warm-up. The tables report the median estimate.
+   These are the absolute numbers for 2.0.0.
+2. **Interleaved A/B against 1.0.0**: one probe program, compiled once
+   against log-io 1.0.0 and once against 2.0.0, run alternately 8 times
+   (each case: 15 timed batches of 100,000 calls after 50,000 warm-up
+   calls, on a non-main thread). The tables report the minimum per case
+   across runs. Running both versions alternately in the same window is
+   the only fair comparison on a shared machine; the minimum filters out
+   time slices lost to other processes.
 
-JSON is fastest because of the batched escaper: clean ASCII runs are
-written as single chunks. logfmt's per-key whitespace replacement and
-human's level-column alignment add overhead.
+All writer cases write into a discarding `io::Write`, so they measure
+the pipeline, not disk or terminal throughput.
 
-## Full pipeline (ns / call, with 3 fields)
+## Formatters (one record, 5 fields, into a reused `String`)
 
-| Path                                    | ns/call |
-|-----------------------------------------|--------:|
-| `dispatch_only` (null sink)             | 6       |
-| `below_threshold` (filtered out)        | 1       |
-| `json + writer` (full pipeline)         | 59      |
-| `logfmt + writer` (full pipeline)       | 63      |
-| `json + writer` (no fields)             | 25      |
-| with 2 default fields                   | 92      |
-| with empty context snapshot             | 74      |
+| Case | 1.0.0 (A/B min) | 2.0.0 (A/B min) | Change | 2.0.0 criterion median |
+|---|---:|---:|---:|---:|
+| JSON | 133.2 ns | 123.0 ns | -7.7% | 125.9 ns |
+| logfmt | 156.7 ns | 115.2 ns | -26.5% | 118.7 ns |
+| human | 199.2 ns | 196.6 ns | -1.3% | 218.6 ns |
+| JSON, no fields | 12.5 ns | 12.2 ns | -2.4% | 12.9 ns |
+| JSON through `&mut dyn fmt::Write` | | | | 200.6 ns |
 
-* The 1 ns filtered-out path means filtering is essentially free -
-  put coarse target-based filtering up front rather than guarding at
-  the call site.
-* Default fields cost roughly 30 ns per record per two fields, because
-  each default field is materialized from owned storage into a
-  borrowed `Field`.
-* The thread-local format buffer (introduced in 0.10.0) eliminates the
-  per-record `String::with_capacity` allocation; the steady-state hot
-  path now allocates only when the buffer is too small to hold the
-  formatted output.
+2.0 escapes more characters (C1 controls, U+2028/U+2029, bidi
+controls) yet is faster: escaping is now a 256-entry table lookup per
+byte that copies clean runs in one write, and JSON metadata
+punctuation is written as fixed strings. The last row shows the cost of
+calling a format through the object-safe `write_record` instead of the
+statically dispatched `write_record_generic` the sinks use.
 
-## Concurrent throughput (records / second)
+## Pipeline (`Logger::log`, 3 fields unless noted)
 
-| Threads | Total records | Wall time | Throughput |
-|--------:|--------------:|----------:|-----------:|
-| 1       | 100 K         | 6 ms      | ~15 M rec/s |
-| 2       | 200 K         | 8 ms      | ~22 M rec/s |
-| 4       | 400 K         | 14 ms     | ~28 M rec/s |
-| 8       | 800 K         | 82 ms     | ~10 M rec/s |
-| 16      | 1.6 M         | 211 ms    | ~7.6 M rec/s |
+| Case | 1.0.0 (A/B min) | 2.0.0 (A/B min) | Change | 2.0.0 criterion median |
+|---|---:|---:|---:|---:|
+| filtered out (below threshold) | 2.0 ns | 0.8 ns | -60% | 0.76 ns |
+| `NullSink` (no formatting) | 7.3 ns | 8.9 ns | +1.6 ns | 9.0 ns |
+| JSON writer | 63.2 ns | 63.8 ns | +0.9% | 66.8 ns |
+| logfmt writer | 65.4 ns | 58.3 ns | -10.9% | 75.8 ns |
+| JSON writer, no fields | 26.4 ns | 31.6 ns | +5.2 ns | 33.4 ns |
+| 2 default fields | 94.2 ns | 91.6 ns | -2.8% | 114.5 ns |
+| context capture, empty | 77.2 ns | 76.4 ns | -1.0% | 90.3 ns |
+| context capture, 2 fields | 105.8 ns | 101.2 ns | -4.3% | 131.8 ns |
+| default configuration (timestamps + context) | 113.3 ns | 114.1 ns | +0.7% | 135.9 ns |
+| `info!` macro, default configuration | 138.9 ns | 137.5 ns | -1.0% | 144.7 ns |
 
-Single-thread throughput is ~15 M records / sec. The pipeline scales
-roughly linearly up to about 4 threads on this hardware; beyond that
-mutex contention on the writer's lock pulls throughput down.
+- Filtered-out records are rejected by comparing against the filter's
+  precomputed minimum level before any rule is scanned.
+- 2.0 does more per record (key de-duplication, the error-handler
+  reentrancy guard, flush-on-level, dispatch-depth tracking for the
+  panic hook). That shows as a fixed 1.5-5 ns on the cheapest paths;
+  on realistic records the faster formatters absorb it.
+- The default configuration's largest cost is the wall-clock read
+  (`SystemTime::now`), roughly 35-40 ns here.
 
-A user who needs more scale than the shared-mutex sinks provide can
-implement a sharded sink (one writer per thread, periodic flushing)
-without leaving the `Sink` trait. That work is outside this crate.
+## Concurrent throughput (one shared logger, JSON writer, 3 fields)
 
-## How to reproduce
+| Threads | 1.0.0 (A/B min) | 2.0.0 (A/B min) | Change |
+|---:|---:|---:|---:|
+| 1 | 62.9 ns/record | 64.4 ns/record | +2.4% |
+| 2 | 45.7 ns/record | 40.0 ns/record | -12.5% |
+| 4 | 32.7 ns/record | 24.4 ns/record | -25.4% |
+| 8 | 71.4 ns/record | 26.8 ns/record | -62.5% |
 
+Criterion (`benches/concurrent.rs`, which also pays for spawning the
+threads in every sample, 20,000 records per thread) measured 12.7, 18.0,
+25.0, 13.3 and 8.1 M records/s for 1, 2, 4, 8 and 16 threads.
+
+The large multi-thread gain comes from keeping each sink's mutex on its
+own cache lines (`CachePadded` in `src/sink.rs`). In 1.0 the mutex
+could share a line with data that every logging thread reads, so each
+lock and unlock stalled all threads. Beyond roughly 8 threads one
+shared sink mutex still serializes writes; use `NonBlocking` (one
+writer thread) or one sink per thread group for more.
+
+## Allocation
+
+`tests/alloc.rs` counts allocations per thread with a counting global
+allocator and asserts zero allocations in steady state for: the default
+configuration (timestamps + context) with JSON, logfmt and human
+output; default fields with context and RFC 3339 timestamps; key
+collisions with redaction; the macros, including `format!`-style
+messages; filtered-out records; the `log` bridge; and `tracing` events
+inside a span.
+
+## Reproduce
+
+```text
+cargo bench --all-features --bench format
+cargo bench --all-features --bench pipeline
+cargo bench --all-features --bench concurrent
+cargo test  --all-features --test alloc
 ```
-cargo bench --bench format       # formatter cost
-cargo bench --bench pipeline     # full Logger::log cost
-cargo bench --bench concurrent   # multi-thread throughput
-```
-
-## What's not measured
-
-* IO cost. `WriterSink<DevNull>` short-circuits the bytes. Real-world
-  numbers depend on disk / socket throughput, not the formatter.
-* Allocation pressure outside the format buffer. Records carry
-  borrowed slices; nothing on the record path allocates.
-* `cargo bench` against rotating file output. If you build a rotating
-  sink (the crate doesn't ship one), benchmark with realistic record
-  sizes and disk latency on the target system.

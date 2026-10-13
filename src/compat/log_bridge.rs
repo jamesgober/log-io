@@ -24,7 +24,8 @@ use crate::value::Value;
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "logfmt", feature = "log"), doc = "```")]
+#[cfg_attr(not(all(feature = "logfmt", feature = "log")), doc = "```ignore")]
 /// use log_io::compat::LogBridge;
 /// use log_io::{Level, Logger};
 ///
@@ -72,7 +73,8 @@ impl LogBridge {
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "log"), doc = "```")]
+#[cfg_attr(not(all(feature = "log")), doc = "```ignore")]
 /// use log_io::compat::to_level_filter;
 /// use log_io::Level;
 ///

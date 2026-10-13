@@ -49,7 +49,8 @@ use crate::record::Record;
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "json"), doc = "```")]
+#[cfg_attr(not(all(feature = "json")), doc = "```ignore")]
 /// use std::sync::Mutex;
 /// use log_io::format::{Format, JsonFormat};
 /// use log_io::{Level, Logger, Record, Result, Sink};
@@ -150,7 +151,8 @@ pub use self::writer::{NullSink, WriterSink};
 ///
 /// # Examples
 ///
-/// ```no_run
+#[cfg_attr(all(feature = "json"), doc = "```no_run")]
+#[cfg_attr(not(all(feature = "json")), doc = "```ignore")]
 /// use log_io::format::JsonFormat;
 /// use log_io::sink::{RotatingFile, RotatingFileSink, Rotation};
 ///

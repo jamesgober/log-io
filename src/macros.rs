@@ -44,8 +44,9 @@ pub mod __private {
 /// log_at!(LEVEL, [target: EXPR,] "literal message" [, ARG | FIELD]* [,])   // global logger
 /// ```
 ///
-/// The level macros ([`trace!`], [`debug!`], [`info!`], [`warn!`],
-/// [`error!`]) take the same arguments without `LEVEL`.
+/// The level macros ([`trace!`](crate::trace!), [`debug!`](crate::debug!),
+/// [`info!`](crate::info!), [`warn!`](crate::warn!),
+/// [`error!`](crate::error!)) take the same arguments without `LEVEL`.
 ///
 /// # Logger
 ///
@@ -85,7 +86,8 @@ pub mod __private {
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "logfmt"), doc = "```")]
+#[cfg_attr(not(all(feature = "logfmt")), doc = "```ignore")]
 /// use log_io::{Level, Logger};
 ///
 /// let logger = Logger::builder().stdout_logfmt().build();
@@ -118,11 +120,12 @@ macro_rules! log_at {
     };
 }
 
-/// Emit a [`crate::Level::Trace`] record. See [`log_at!`] for the syntax.
+/// Emit a [`crate::Level::Trace`] record. See [`log_at!`](crate::log_at!) for the syntax.
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "json"), doc = "```")]
+#[cfg_attr(not(all(feature = "json")), doc = "```ignore")]
 /// # let logger = log_io::Logger::builder().stdout_json().build();
 /// log_io::trace!(logger, "entering", depth = 3_u8);
 /// ```
@@ -131,11 +134,12 @@ macro_rules! trace {
     ($($args:tt)+) => { $crate::__log_io_level!($crate::Level::Trace; $($args)+) };
 }
 
-/// Emit a [`crate::Level::Debug`] record. See [`log_at!`] for the syntax.
+/// Emit a [`crate::Level::Debug`] record. See [`log_at!`](crate::log_at!) for the syntax.
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "json"), doc = "```")]
+#[cfg_attr(not(all(feature = "json")), doc = "```ignore")]
 /// # let logger = log_io::Logger::builder().stdout_json().build();
 /// log_io::debug!(logger, "cache miss for {}", "user:42", shard = 7_u8);
 /// ```
@@ -144,11 +148,12 @@ macro_rules! debug {
     ($($args:tt)+) => { $crate::__log_io_level!($crate::Level::Debug; $($args)+) };
 }
 
-/// Emit a [`crate::Level::Info`] record. See [`log_at!`] for the syntax.
+/// Emit a [`crate::Level::Info`] record. See [`log_at!`](crate::log_at!) for the syntax.
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "json"), doc = "```")]
+#[cfg_attr(not(all(feature = "json")), doc = "```ignore")]
 /// let logger = log_io::Logger::builder().stdout_json().build();
 /// log_io::info!(logger, "server started", port = 8080_u16);
 ///
@@ -160,11 +165,12 @@ macro_rules! info {
     ($($args:tt)+) => { $crate::__log_io_level!($crate::Level::Info; $($args)+) };
 }
 
-/// Emit a [`crate::Level::Warn`] record. See [`log_at!`] for the syntax.
+/// Emit a [`crate::Level::Warn`] record. See [`log_at!`](crate::log_at!) for the syntax.
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "json"), doc = "```")]
+#[cfg_attr(not(all(feature = "json")), doc = "```ignore")]
 /// # let logger = log_io::Logger::builder().stdout_json().build();
 /// log_io::warn!(logger, "slow request", path = "/api", ms = 412_u64);
 /// ```
@@ -173,14 +179,15 @@ macro_rules! warn {
     ($($args:tt)+) => { $crate::__log_io_level!($crate::Level::Warn; $($args)+) };
 }
 
-/// Emit a [`crate::Level::Error`] record. See [`log_at!`] for the syntax.
+/// Emit a [`crate::Level::Error`] record. See [`log_at!`](crate::log_at!) for the syntax.
 ///
 /// With the default flush policy the record is flushed to every sink
 /// before the macro returns.
 ///
 /// # Examples
 ///
-/// ```
+#[cfg_attr(all(feature = "json"), doc = "```")]
+#[cfg_attr(not(all(feature = "json")), doc = "```ignore")]
 /// # let logger = log_io::Logger::builder().stdout_json().build();
 /// let err = std::io::Error::other("connection reset");
 /// log_io::error!(logger, "request failed", error = log_io::Value::Error(&err));
