@@ -100,8 +100,8 @@ pub fn shutdown() -> Result<()> {
 /// and flushes it, then runs the previously installed hook.
 ///
 /// The record is emitted at [`Level::Error`] with target `panic`, the
-/// panic message as its message, and `file`, `line`, `column` and
-/// `thread` fields. Because the hook runs before unwinding (or before
+/// panic message as its message, the panic location as its source
+/// location, and `thread` and `column` fields. Because the hook runs before unwinding (or before
 /// the process aborts under `panic = "abort"`), this preserves the
 /// final records that would otherwise sit in a buffer.
 ///
@@ -130,18 +130,19 @@ fn log_panic(logger: &Logger, info: &std::panic::PanicHookInfo<'_>) {
         .unwrap_or("panic with a non-string payload");
     let thread = std::thread::current();
     let thread_name = thread.name().unwrap_or("<unnamed>");
-    let (file, line, column) = info
-        .location()
-        .map_or(("<unknown>", 0, 0), |l| (l.file(), l.line(), l.column()));
-    let fields = [
-        Field::new("file", file),
-        Field::new("line", line),
-        Field::new("column", column),
+    let mut metadata = Metadata::new(Level::Error, "panic");
+    let mut fields = [
         Field::new("thread", thread_name),
+        Field::new("column", 0_u32),
     ];
-    let metadata = Metadata::new(Level::Error, "panic");
+    let mut count = 1;
+    if let Some(location) = info.location() {
+        metadata = metadata.with_location(location.file(), location.line());
+        fields[1] = Field::new("column", location.column());
+        count = 2;
+    }
     // Errors were already passed to the logger's error handler.
-    let _reported = logger.try_emit(metadata, message, &fields);
+    let _reported = logger.try_emit(metadata, message, &fields[..count]);
     let _flushed = logger.flush();
 }
 

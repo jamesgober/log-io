@@ -134,6 +134,7 @@ impl Visit for SpanFields {
 }
 
 /// Where a collected value lives.
+#[derive(Clone)]
 enum Slot {
     /// A value with no borrowed data.
     Scalar(Value<'static>),
@@ -142,6 +143,7 @@ enum Slot {
 }
 
 /// Key of a collected field.
+#[derive(Clone)]
 enum Key {
     Static(&'static str),
     Text(Range<usize>),
@@ -153,7 +155,13 @@ struct Arena {
     text: String,
     message: Option<Range<usize>>,
     event: Vec<(Key, Slot)>,
+    /// Span fields, root span first.
     spans: Vec<(Key, Slot)>,
+    /// Span fields as collected, leaf span first, with the start index
+    /// of each span's block. Reordered into `spans` afterwards; walking
+    /// the scope leaf-first avoids the allocation in `Scope::from_root`.
+    scratch: Vec<(Key, Slot)>,
+    blocks: Vec<usize>,
 }
 
 impl Arena {
@@ -163,6 +171,8 @@ impl Arena {
             message: None,
             event: Vec::new(),
             spans: Vec::new(),
+            scratch: Vec::new(),
+            blocks: Vec::new(),
         }
     }
 
@@ -171,6 +181,19 @@ impl Arena {
         self.message = None;
         self.event.clear();
         self.spans.clear();
+        self.scratch.clear();
+        self.blocks.clear();
+    }
+
+    /// Move the collected span blocks into `spans`, root span first.
+    fn order_spans_root_first(&mut self) {
+        let mut end = self.scratch.len();
+        for &start in self.blocks.iter().rev() {
+            if let Some(block) = self.scratch.get(start..end) {
+                self.spans.extend_from_slice(block);
+            }
+            end = start;
+        }
     }
 
     fn push_text(&mut self, f: impl FnOnce(&mut String) -> fmt::Result) -> Range<usize> {
@@ -213,7 +236,7 @@ impl Arena {
             Value::Char(c) => Slot::Scalar(Value::Char(c)),
             other => Slot::Text(self.push_text(|t| write!(t, "{other}"))),
         };
-        self.spans.push((key, slot));
+        self.scratch.push((key, slot));
     }
 }
 
@@ -336,14 +359,16 @@ impl TracingLayer {
         arena.clear();
         event.record(&mut EventVisitor(arena));
         if let Some(scope) = ctx.event_scope(event) {
-            for span in scope.from_root() {
+            for span in scope {
                 let extensions = span.extensions();
                 if let Some(fields) = extensions.get::<SpanFields>() {
+                    arena.blocks.push(arena.scratch.len());
                     for field in &fields.0 {
                         arena.add_span_field(field);
                     }
                 }
             }
+            arena.order_spans_root_first();
         }
 
         let meta = event.metadata();
@@ -475,8 +500,21 @@ mod tests {
             let _i = inner.enter();
             let _span = inner.record("bytes", &b"\x01\xff"[..]);
             tracing::info!(user = "event", "query");
+            tracing::info!("no user field on the event");
         });
         let text = out.take();
+        let mut lines = text.lines();
+        let first = lines.next().unwrap_or_default();
+        let second = lines.next().unwrap_or_default();
+        assert!(
+            second.contains(" user=svc"),
+            "inner span shadows outer: {second}"
+        );
+        assert!(
+            second.find(" id=7").unwrap() < second.find(" user=svc").unwrap(),
+            "root span fields come first: {second}"
+        );
+        let text = first.to_owned();
         assert!(text.contains(" id=7 "), "{text}");
         assert!(text.contains(" tenant=acme "), "{text}");
         assert!(text.contains(" bytes=01ff"), "{text}");
