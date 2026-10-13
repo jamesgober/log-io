@@ -100,7 +100,7 @@ impl<W: Write + Send, F: Format + core::fmt::Debug> core::fmt::Debug for WriterS
 /// let logger = Logger::builder().with_sink(NullSink::new()).build();
 /// logger.log(Level::Error, "dropped", &[]);
 /// ```
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct NullSink;
 
 impl NullSink {
