@@ -1,32 +1,16 @@
-//! Micro-benchmarks for the three built-in formatters.
+//! Formatter-only cost: serialize one record into a reused `String`.
 //!
-//! Run with `cargo bench --bench format`. The bench harness is a hand-
-//! rolled loop because this crate intentionally has zero runtime
-//! dependencies; numbers report ns/iter for each format.
+//! Run with `cargo bench --bench format`. These numbers isolate the
+//! three built-in formatters from locking, IO, filtering, and clock
+//! reads.
 
 use std::hint::black_box;
-use std::time::Instant;
 
+use criterion::{Criterion, criterion_group, criterion_main};
 use log_io::format::{Format, HumanFormat, JsonFormat, LogfmtFormat};
 use log_io::{Field, Level, Metadata, Record, Value};
 
-const ITERS: u32 = 200_000;
-
-fn time<F: FnMut()>(name: &str, mut f: F) {
-    // Warm up.
-    for _ in 0..1000 {
-        f();
-    }
-    let start = Instant::now();
-    for _ in 0..ITERS {
-        f();
-    }
-    let elapsed = start.elapsed();
-    let per = elapsed.as_nanos() / u128::from(ITERS);
-    println!("{name:>20}: {per:>5} ns/record");
-}
-
-fn main() {
+fn format_benches(c: &mut Criterion) {
     let fields = [
         Field::new("port", Value::U64(8080)),
         Field::new("host", Value::Str("0.0.0.0")),
@@ -39,34 +23,52 @@ fn main() {
         "request completed",
         &fields,
     );
+    let empty = Record::new(Metadata::new(Level::Info, "t"), "msg", &[]);
 
     let json = JsonFormat::new();
     let logfmt = LogfmtFormat::new();
     let human = HumanFormat::new();
+    let mut buf = String::with_capacity(512);
 
-    let mut buf = String::with_capacity(256);
-
-    time("json", || {
-        buf.clear();
-        json.write_record(black_box(&record), &mut buf).unwrap();
-        black_box(&buf);
+    let mut group = c.benchmark_group("format");
+    group.bench_function("json_5_fields", |b| {
+        b.iter(|| {
+            buf.clear();
+            json.write_record(black_box(&record), &mut buf).unwrap();
+            black_box(buf.len())
+        });
     });
-    time("logfmt", || {
-        buf.clear();
-        logfmt.write_record(black_box(&record), &mut buf).unwrap();
-        black_box(&buf);
+    group.bench_function("logfmt_5_fields", |b| {
+        b.iter(|| {
+            buf.clear();
+            logfmt.write_record(black_box(&record), &mut buf).unwrap();
+            black_box(buf.len())
+        });
     });
-    time("human", || {
-        buf.clear();
-        human.write_record(black_box(&record), &mut buf).unwrap();
-        black_box(&buf);
+    group.bench_function("human_5_fields", |b| {
+        b.iter(|| {
+            buf.clear();
+            human.write_record(black_box(&record), &mut buf).unwrap();
+            black_box(buf.len())
+        });
     });
-
-    // Empty-record cost: lower bound for serialization overhead.
-    let empty = Record::new(Metadata::new(Level::Info, "t"), "msg", &[]);
-    time("json (no fields)", || {
-        buf.clear();
-        json.write_record(black_box(&empty), &mut buf).unwrap();
-        black_box(&buf);
+    group.bench_function("json_no_fields", |b| {
+        b.iter(|| {
+            buf.clear();
+            json.write_record(black_box(&empty), &mut buf).unwrap();
+            black_box(buf.len())
+        });
     });
+    group.bench_function("json_5_fields_dyn_writer", |b| {
+        b.iter(|| {
+            buf.clear();
+            let w: &mut dyn core::fmt::Write = &mut buf;
+            json.write_record(black_box(&record), w).unwrap();
+            black_box(buf.len())
+        });
+    });
+    group.finish();
 }
+
+criterion_group!(benches, format_benches);
+criterion_main!(benches);

@@ -1,18 +1,20 @@
-//! Concurrent throughput benchmark.
+//! Multi-thread throughput: N threads logging into one shared logger.
 //!
-//! Spawns N worker threads each logging records to a shared logger
-//! backed by a discarding writer. Reports total records/sec.
+//! Run with `cargo bench --bench concurrent`. Each sample spawns N
+//! scoped threads that each emit a fixed number of records into a
+//! single JSON `WriterSink` backed by a discarding writer, so the
+//! measurement is dominated by formatting and the sink mutex. The
+//! reported throughput is records per second across all threads.
 
 use std::hint::black_box;
 use std::io::{self, Write};
-use std::sync::Arc;
-use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use log_io::format::JsonFormat;
 use log_io::{Field, Level, Logger, Value};
 
-const RECORDS_PER_THREAD: u64 = 100_000;
+const RECORDS_PER_THREAD: u64 = 20_000;
 
 struct DevNull;
 
@@ -25,44 +27,49 @@ impl Write for DevNull {
     }
 }
 
-fn run(threads: usize) {
-    let logger = Arc::new(
-        Logger::builder()
-            .level(Level::Trace)
-            .no_timestamps()
-            .no_context()
-            .writer(DevNull, JsonFormat::new())
-            .build(),
-    );
+fn run(logger: &Logger, threads: usize) -> Duration {
     let start = Instant::now();
-    let mut handles = Vec::new();
-    for _ in 0..threads {
-        let logger = Arc::clone(&logger);
-        handles.push(thread::spawn(move || {
-            let fields = [
-                Field::new("port", Value::U64(8080)),
-                Field::new("host", Value::Str("0.0.0.0")),
-                Field::new("path", Value::Str("/api/users")),
-            ];
-            for _ in 0..RECORDS_PER_THREAD {
-                logger.log(Level::Info, black_box("tick"), &fields);
-            }
-        }));
-    }
-    for h in handles {
-        h.join().unwrap();
-    }
-    let elapsed = start.elapsed();
-    let total = u128::from(RECORDS_PER_THREAD * threads as u64);
-    let per_sec = (total * 1_000_000_000) / elapsed.as_nanos().max(1);
-    println!(
-        "{threads:>2} threads: {total:>10} records in {:>6} ms => {per_sec:>10} rec/s",
-        elapsed.as_millis()
-    );
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                let fields = [
+                    Field::new("port", Value::U64(8080)),
+                    Field::new("host", Value::Str("0.0.0.0")),
+                    Field::new("path", Value::Str("/api/users")),
+                ];
+                for _ in 0..RECORDS_PER_THREAD {
+                    logger.log(Level::Info, black_box("tick"), &fields);
+                }
+            });
+        }
+    });
+    start.elapsed()
 }
 
-fn main() {
-    for &n in &[1_usize, 2, 4, 8, 16] {
-        run(n);
+fn concurrent_benches(c: &mut Criterion) {
+    let logger = Logger::builder()
+        .level(Level::Trace)
+        .no_timestamps()
+        .no_context()
+        .writer(DevNull, JsonFormat::new())
+        .build();
+
+    let mut group = c.benchmark_group("concurrent");
+    group.sample_size(20);
+    for threads in [1_usize, 2, 4, 8, 16] {
+        group.throughput(Throughput::Elements(RECORDS_PER_THREAD * threads as u64));
+        group.bench_function(format!("threads_{threads}"), |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    total += run(&logger, threads);
+                }
+                total
+            });
+        });
     }
+    group.finish();
 }
+
+criterion_group!(benches, concurrent_benches);
+criterion_main!(benches);

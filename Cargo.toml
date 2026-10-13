@@ -37,6 +37,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 
 [dev-dependencies]
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 
 [workspace]
@@ -116,3 +117,7 @@ required-features = ["std", "json", "logfmt", "human"]
 name = "property"
 required-features = ["std", "json", "logfmt", "human"]
 
+
+[[test]]
+name = "alloc"
+required-features = ["std", "json", "logfmt", "human"]

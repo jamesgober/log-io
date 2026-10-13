@@ -1,22 +1,33 @@
-//! End-to-end pipeline benchmark: Logger -> Filter -> Format -> Sink.
+//! End-to-end pipeline cost: `Logger` -> filter -> format -> sink.
 //!
-//! Three paths are measured:
+//! Run with `cargo bench --bench pipeline`. Every writer-backed case
+//! writes into a discarding `io::Write`, so the numbers measure the
+//! pipeline itself rather than disk or terminal throughput.
 //!
-//! 1. `dispatch_only` - sink discards the record before formatting.
-//!    Measures filter + context snapshot + dispatch overhead.
-//! 2. `below_threshold` - record filtered out. Measures the gate.
-//! 3. `* + writer` - the full pipeline, format included, writing to
-//!    a non-allocating discarding `Write`.
+//! Cases:
+//!
+//! * `dispatch_only` - a `NullSink` that never formats. Filter check,
+//!   record assembly and dispatch overhead.
+//! * `below_threshold` - the record is rejected by the filter.
+//! * `json_writer` / `logfmt_writer` - the full pipeline with three
+//!   call-site fields, timestamps and context capture disabled.
+//! * `json_writer_no_fields` - the same with no fields.
+//! * `default_fields_2` - two logger-level default fields merged in.
+//! * `context_empty` / `context_2` - thread-local context capture
+//!   enabled with zero or two context fields installed.
+//! * `default_config` - `Logger::builder()` defaults: wall-clock
+//!   timestamp on every record plus context capture. This is the
+//!   cost a typical user pays.
+//! * `macro_info` - the `info!` macro with three fields on the
+//!   default configuration.
 
 use std::hint::black_box;
 use std::io::{self, Write};
-use std::time::Instant;
 
+use criterion::{Criterion, criterion_group, criterion_main};
 use log_io::format::{JsonFormat, LogfmtFormat};
 use log_io::sink::NullSink;
-use log_io::{Field, Level, Logger, Value};
-
-const ITERS: u32 = 200_000;
+use log_io::{Field, Level, Logger, Value, context};
 
 struct DevNull;
 
@@ -29,60 +40,35 @@ impl Write for DevNull {
     }
 }
 
-fn time<F: FnMut()>(name: &str, mut f: F) {
-    for _ in 0..1000 {
-        f();
-    }
-    let start = Instant::now();
-    for _ in 0..ITERS {
-        f();
-    }
-    let elapsed = start.elapsed();
-    let per = elapsed.as_nanos() / u128::from(ITERS);
-    println!("{name:>34}: {per:>5} ns/call");
-}
-
-fn main() {
-    let logger_null = Logger::builder()
+fn quiet() -> log_io::LoggerBuilder {
+    Logger::builder()
         .level(Level::Trace)
         .no_timestamps()
         .no_context()
-        .with_sink(NullSink::new())
-        .build();
+}
 
-    let logger_filtered = Logger::builder()
+fn pipeline_benches(c: &mut Criterion) {
+    let null = quiet().with_sink(NullSink::new()).build();
+    let filtered = Logger::builder()
         .level(Level::Error)
         .no_timestamps()
         .no_context()
         .with_sink(NullSink::new())
         .build();
-
-    let logger_json_writer = Logger::builder()
-        .level(Level::Trace)
-        .no_timestamps()
-        .no_context()
-        .writer(DevNull, JsonFormat::new())
-        .build();
-
-    let logger_logfmt_writer = Logger::builder()
-        .level(Level::Trace)
-        .no_timestamps()
-        .no_context()
-        .writer(DevNull, LogfmtFormat::new())
-        .build();
-
-    let logger_default_fields = Logger::builder()
-        .level(Level::Trace)
-        .no_timestamps()
-        .no_context()
+    let json = quiet().writer(DevNull, JsonFormat::new()).build();
+    let logfmt = quiet().writer(DevNull, LogfmtFormat::new()).build();
+    let defaults = quiet()
         .with_default_field("service", "api")
         .with_default_field("version", "1.2.3")
         .writer(DevNull, JsonFormat::new())
         .build();
-
-    let logger_with_ctx_capture = Logger::builder()
+    let with_ctx = Logger::builder()
         .level(Level::Trace)
         .no_timestamps()
+        .writer(DevNull, JsonFormat::new())
+        .build();
+    let default_cfg = Logger::builder()
+        .level(Level::Trace)
         .writer(DevNull, JsonFormat::new())
         .build();
 
@@ -92,25 +78,52 @@ fn main() {
         Field::new("path", Value::Str("/api/users")),
     ];
 
-    time("dispatch_only (null sink)", || {
-        logger_null.log(Level::Info, black_box("hello"), &fields);
+    let mut group = c.benchmark_group("pipeline");
+    group.bench_function("dispatch_only", |b| {
+        b.iter(|| null.log(Level::Info, black_box("hello"), &fields));
     });
-    time("below_threshold (filtered out)", || {
-        logger_filtered.log(Level::Info, black_box("hello"), &fields);
+    group.bench_function("below_threshold", |b| {
+        b.iter(|| filtered.log(Level::Info, black_box("hello"), &fields));
     });
-    time("json + writer (full pipeline)", || {
-        logger_json_writer.log(Level::Info, black_box("hello"), &fields);
+    group.bench_function("json_writer", |b| {
+        b.iter(|| json.log(Level::Info, black_box("hello"), &fields));
     });
-    time("logfmt + writer (full pipeline)", || {
-        logger_logfmt_writer.log(Level::Info, black_box("hello"), &fields);
+    group.bench_function("logfmt_writer", |b| {
+        b.iter(|| logfmt.log(Level::Info, black_box("hello"), &fields));
     });
-    time("json + writer (no fields)", || {
-        logger_json_writer.log(Level::Info, black_box("hello"), &[]);
+    group.bench_function("json_writer_no_fields", |b| {
+        b.iter(|| json.log(Level::Info, black_box("hello"), &[]));
     });
-    time("with 2 default fields", || {
-        logger_default_fields.log(Level::Info, black_box("hello"), &fields);
+    group.bench_function("default_fields_2", |b| {
+        b.iter(|| defaults.log(Level::Info, black_box("hello"), &fields));
     });
-    time("with empty context snapshot", || {
-        logger_with_ctx_capture.log(Level::Info, black_box("hello"), &fields);
+    context::clear();
+    group.bench_function("context_empty", |b| {
+        b.iter(|| with_ctx.log(Level::Info, black_box("hello"), &fields));
     });
+    {
+        let _t = context::with_trace_id("tx-7f3a");
+        let _r = context::with_request_id("req-001");
+        group.bench_function("context_2", |b| {
+            b.iter(|| with_ctx.log(Level::Info, black_box("hello"), &fields));
+        });
+    }
+    group.bench_function("default_config", |b| {
+        b.iter(|| default_cfg.log(Level::Info, black_box("hello"), &fields));
+    });
+    group.bench_function("macro_info", |b| {
+        b.iter(|| {
+            log_io::info!(
+                default_cfg,
+                "hello",
+                port = 8080_u64,
+                host = "0.0.0.0",
+                path = "/api/users"
+            );
+        });
+    });
+    group.finish();
 }
+
+criterion_group!(benches, pipeline_benches);
+criterion_main!(benches);
