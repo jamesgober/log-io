@@ -41,8 +41,9 @@ impl Rotation {
 ///
 /// The active file is always at the configured path. On rotation it is
 /// renamed to `<path>.1`, an existing `<path>.1` becomes `<path>.2`,
-/// and so on; files beyond `max_files` are deleted. With `max_files(0)`
-/// the old content is discarded instead of kept.
+/// and so on; the file that would move past `<path>.<max_files>` is
+/// deleted. With `max_files(0)` the active file is deleted at rotation
+/// instead of kept.
 ///
 /// Rotation happens between records, never inside one: the size check
 /// runs before each `write` call, and the built-in sinks write a whole
@@ -51,17 +52,42 @@ impl Rotation {
 ///
 /// Use it as the writer of a [`super::WriterSink`] (aliased as
 /// [`super::RotatingFileSink`]) or of a [`super::NonBlocking`] sink.
+/// Behind a `NonBlocking` sink, records reach this writer in batches
+/// through the worker's write buffer (64 KiB by default), so a file can
+/// exceed `max_bytes` by up to that buffer size and period boundaries
+/// are honoured per batch; set the worker's `buffer_capacity(0)` for
+/// per-record precision.
 ///
-/// # Platform behaviour
+/// # Failed rotation
 ///
 /// The current file handle is flushed and closed before any rename, so
-/// rotation works on Windows as well as Unix. If a rename still fails
-/// (on Windows, typically because another process holds the file open
-/// without delete sharing), no record is lost: the writer reopens the
-/// existing file, keeps appending, retries after another `max_bytes`
-/// or at the next period, and reports the rotation error from the next
-/// [`Write::flush`] call (which the logger passes to its error
-/// handler).
+/// rotation works on Windows as well as Unix. A rotation is all or
+/// nothing:
+///
+/// 1. the active file is moved to `<path>.rotating`. If that fails (on
+///    Windows, typically because another process holds the file open
+///    without delete sharing), nothing else has been touched;
+/// 2. the history is shifted up one slot, the oldest file going to
+///    `<path>.pruning` rather than being deleted;
+/// 3. `<path>.rotating` becomes `<path>.1`, and only then is
+///    `<path>.pruning` deleted.
+///
+/// If a rename in steps 2-3 fails, the renames already done are undone
+/// in reverse order. So a failed rotation never deletes or overwrites
+/// rotated history: every rotated file keeps its name and content. The
+/// writer then reopens the active file, keeps appending to it, retries
+/// after another `max_bytes` or at the next period, and reports the
+/// error from the next [`Write::flush`] call (which the logger passes
+/// to its error handler).
+///
+/// If an undo fails as well (a second fault, for example the directory
+/// becoming read-only mid-rotation), the rollback stops and the files
+/// keep whatever names they have at that point; still nothing is
+/// deleted. Records that were in the active file stay in
+/// `<path>.rotating`, the writer starts a new active file, and every
+/// later rotation attempt fails with [`io::ErrorKind::AlreadyExists`]
+/// naming that file (so it is never overwritten) until an operator
+/// moves it aside.
 ///
 /// # Examples
 ///
@@ -137,8 +163,11 @@ impl RotatingFile {
     }
 
     fn current_period(&self) -> Option<u64> {
-        let secs = unix_secs((self.now)());
-        self.rotation.period_secs().map(|p| secs / p)
+        // Read the clock only when a schedule is configured: `now` costs
+        // tens of nanoseconds per record on some platforms.
+        self.rotation
+            .period_secs()
+            .map(|p| unix_secs((self.now)()) / p)
     }
 
     fn should_rotate(&mut self, incoming: usize) -> bool {
@@ -150,11 +179,10 @@ impl RotatingFile {
         let too_big = self
             .max_bytes
             .is_some_and(|max| self.size.saturating_add(incoming as u64) > max);
-        let new_period = match (self.period, self.current_period()) {
-            (Some(open), Some(now)) => now != open,
-            _ => false,
-        };
-        too_big || new_period
+        too_big
+            || self
+                .period
+                .is_some_and(|open| self.current_period() != Some(open))
     }
 
     fn rotate(&mut self) -> io::Result<()> {
@@ -167,31 +195,138 @@ impl RotatingFile {
             // rename a file this process still has open.
             drop(writer);
         }
-        let shifted = self.shift_files();
+        let rotated = self.move_active_into_history();
         let reopened = open_append(&self.path, self.buffer_capacity);
         match reopened {
             Ok((writer, size)) => {
                 self.file = Some(writer);
-                // After a failed shift `size` is the old file's length;
-                // count from zero anyway so the next attempt happens
-                // after another `max_bytes` rather than on every write.
-                self.size = if shifted.is_ok() { size } else { 0 };
+                // After a failed rotation `size` is the old file's
+                // length; count from zero anyway so the next attempt
+                // happens after another `max_bytes` rather than on every
+                // write.
+                self.size = if rotated.is_ok() { size } else { 0 };
                 self.period = self.current_period();
-                shifted
+                rotated
             }
             Err(e) => Err(e),
         }
     }
 
-    fn shift_files(&self) -> io::Result<()> {
+    fn sibling(&self, suffix: &str) -> PathBuf {
+        let mut name = OsString::from(self.path.as_os_str());
+        name.push(suffix);
+        PathBuf::from(name)
+    }
+
+    /// Move the (closed) active file to `<path>.1`, shifting and pruning
+    /// the history, as one all-or-nothing step.
+    ///
+    /// The active file is first moved to a staging name, so the common
+    /// failure (another process holds the active file) is detected
+    /// before any history file is touched. The oldest file is moved to a
+    /// pruning name instead of being deleted, and deleted only after
+    /// every other rename has succeeded. If any rename fails, the ones
+    /// already done are undone in reverse order and the error is
+    /// returned: rotated history is never deleted or overwritten by a
+    /// rotation that did not complete.
+    fn move_active_into_history(&self) -> io::Result<()> {
         if self.max_files == 0 {
+            // No history is kept: rotation discards the active file.
             return remove_if_exists(&self.path);
         }
-        remove_if_exists(&self.rotated_path(self.max_files))?;
-        for index in (1..self.max_files).rev() {
-            rename_if_exists(&self.rotated_path(index), &self.rotated_path(index + 1))?;
+        let staging = self.sibling(STAGING_SUFFIX);
+        let pruning = self.sibling(PRUNING_SUFFIX);
+        if fs::symlink_metadata(&staging).is_ok() {
+            // Left behind by a rotation whose rollback also failed. It
+            // holds records; never overwrite it.
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} was left by an interrupted rotation and holds log records;                      move it aside to resume rotation",
+                    staging.display()
+                ),
+            ));
         }
-        fs::rename(&self.path, self.rotated_path(1))
+        // Only a completed rotation leaves this file, and its content
+        // was already pruned by that rotation.
+        remove_if_exists(&pruning)?;
+
+        let mut moves = Vec::with_capacity(self.max_files + 2);
+        moves.push(Move::required(self.path.clone(), staging.clone()));
+        moves.push(Move::optional(
+            self.rotated_path(self.max_files),
+            pruning.clone(),
+        ));
+        for index in (1..self.max_files).rev() {
+            moves.push(Move::optional(
+                self.rotated_path(index),
+                self.rotated_path(index + 1),
+            ));
+        }
+        moves.push(Move::required(staging, self.rotated_path(1)));
+
+        let mut done = Vec::with_capacity(moves.len());
+        for step in &moves {
+            match rename_file(&step.from, &step.to) {
+                Ok(()) => done.push(step),
+                Err(e) if !step.required && e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    roll_back(&done);
+                    return Err(e);
+                }
+            }
+        }
+        // The rotation is complete. If this fails, the pruned file stays
+        // under the pruning name and is removed by the next rotation.
+        remove_if_exists(&pruning)
+    }
+}
+
+/// Name the active file is moved to while the history is shifted.
+const STAGING_SUFFIX: &str = ".rotating";
+/// Name the oldest rotated file is moved to until the rotation is
+/// complete.
+const PRUNING_SUFFIX: &str = ".pruning";
+
+/// One rename of a rotation.
+struct Move {
+    from: PathBuf,
+    to: PathBuf,
+    /// `false` for history slots, which may legitimately be missing.
+    required: bool,
+}
+
+impl Move {
+    const fn required(from: PathBuf, to: PathBuf) -> Self {
+        Self {
+            from,
+            to,
+            required: true,
+        }
+    }
+
+    const fn optional(from: PathBuf, to: PathBuf) -> Self {
+        Self {
+            from,
+            to,
+            required: false,
+        }
+    }
+}
+
+/// Undo completed renames, newest first.
+///
+/// Each undo moves a file back to the name the forward rename vacated,
+/// and every later rename that targeted that name has already been
+/// undone. If an undo fails, stop: undoing an earlier rename could then
+/// replace a file that is still in the way. The files keep their
+/// shifted names (nothing is deleted), and the staging file left behind
+/// makes later rotations refuse to run until an operator steps in.
+fn roll_back(done: &[&Move]) {
+    for step in done.iter().rev() {
+        if rename_file(&step.to, &step.from).is_err() {
+            return;
+        }
     }
 }
 
@@ -346,11 +481,15 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
     }
 }
 
-fn rename_if_exists(from: &Path, to: &Path) -> io::Result<()> {
-    match fs::rename(from, to) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-        _ => Ok(()),
+fn rename_file(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if tests::rename_is_blocked(from, to) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "rename blocked by the test",
+        ));
     }
+    fs::rename(from, to)
 }
 
 #[cfg(test)]
@@ -494,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rotating_file_failed_rotation_keeps_writing_and_defers_error() {
+    fn test_rotating_file_prune_failure_is_reported_once_and_keeps_records() {
         let dir = TempDir::new("fail");
         let path = dir.file("f.log");
         let mut w = RotatingFile::builder(&path)
@@ -503,12 +642,284 @@ mod tests {
             .open()
             .unwrap();
         w.write_all(b"one\n").unwrap();
-        // Make the shift fail: a directory where `f.log.1` should go
-        // cannot be removed with `remove_file` on any platform.
+        // A directory in the oldest slot is moved to the pruning name
+        // but cannot be removed with `remove_file` on any platform.
         fs::create_dir(dir.file("f.log.1")).unwrap();
         w.write_all(b"two\n").unwrap();
         assert!(w.flush().is_err(), "rotation failure must surface on flush");
         assert!(w.flush().is_ok(), "the error is reported once");
-        assert_eq!(read(&path), "one\ntwo\n", "no record may be lost");
+        assert_eq!(read(&dir.file("f.log.1")), "one\n");
+        assert_eq!(read(&path), "two\n");
+        assert!(dir.file("f.log.pruning").is_dir());
+        // The leftover still cannot be removed, so the next rotation is
+        // refused before anything moves.
+        w.write_all(b"three\n").unwrap();
+        assert!(w.flush().is_err());
+        assert_eq!(read(&dir.file("f.log.1")), "one\n");
+        assert_eq!(read(&path), "two\nthree\n", "no record may be lost");
+    }
+
+    #[test]
+    fn test_rotating_file_rotates_at_exactly_max_bytes_not_before() {
+        let dir = TempDir::new("edge");
+        let path = dir.file("edge.log");
+        let mut w = RotatingFile::builder(&path)
+            .max_bytes(10)
+            .buffer_capacity(0)
+            .open()
+            .unwrap();
+        w.write_all(b"01234").unwrap();
+        w.write_all(b"56789").unwrap();
+        assert!(!dir.file("edge.log.1").exists(), "exactly max_bytes fits");
+        w.write_all(b"a").unwrap();
+        assert_eq!(read(&dir.file("edge.log.1")), "0123456789");
+        assert_eq!(read(&path), "a");
+    }
+
+    #[test]
+    fn test_rotating_file_drop_flushes_buffered_records() {
+        let dir = TempDir::new("drop");
+        let path = dir.file("d.log");
+        let mut w = RotatingFile::builder(&path).open().unwrap();
+        w.write_all(b"buffered\n").unwrap();
+        assert_eq!(read(&path), "", "still in the write buffer");
+        drop(w);
+        assert_eq!(read(&path), "buffered\n");
+    }
+
+    #[test]
+    fn test_rotating_file_never_reads_the_clock_without_a_schedule() {
+        fn exploding_clock() -> SystemTime {
+            panic!("the clock must not be read for Rotation::Never");
+        }
+        let dir = TempDir::new("noclock");
+        let path = dir.file("n.log");
+        let mut w = RotatingFile::builder(&path)
+            .max_bytes(4)
+            .open_with_clock(exploding_clock)
+            .unwrap();
+        w.write_all(b"one\n").unwrap();
+        w.write_all(b"two\n").unwrap();
+        w.flush().unwrap();
+        assert_eq!(read(&dir.file("n.log.1")), "one\n");
+    }
+
+    thread_local! {
+        /// Renames (from, to) that fail with `PermissionDenied`, to
+        /// simulate on every platform what another process holding a
+        /// file does on Windows.
+        static BLOCKED: core::cell::RefCell<Vec<(PathBuf, PathBuf)>> =
+            const { core::cell::RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn rename_is_blocked(from: &Path, to: &Path) -> bool {
+        BLOCKED.with(|b| b.borrow().iter().any(|(f, t)| f == from && t == to))
+    }
+
+    fn block_rename(from: PathBuf, to: PathBuf) {
+        BLOCKED.with(|b| b.borrow_mut().push((from, to)));
+    }
+
+    fn unblock_renames() {
+        BLOCKED.with(|b| b.borrow_mut().clear());
+    }
+
+    /// Writer with `max_bytes(5)`, `max_files(3)`, the active file
+    /// holding `11111` and history `.1..=.3` seeded.
+    fn seeded_writer(dir: &TempDir, base: &str) -> RotatingFile {
+        let mut w = RotatingFile::builder(dir.file(base))
+            .max_bytes(5)
+            .max_files(3)
+            .buffer_capacity(0)
+            .open()
+            .unwrap();
+        w.write_all(b"11111").unwrap();
+        seed_history(dir, base, 3);
+        w
+    }
+
+    fn rotation_files(dir: &TempDir) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn test_rotating_file_blocked_active_rename_keeps_history_on_every_platform() {
+        let dir = TempDir::new("blocked-active");
+        let mut w = seeded_writer(&dir, "a.log");
+        block_rename(dir.file("a.log"), dir.file("a.log.rotating"));
+        for i in 0..6 {
+            w.write_all(format!("r{i}xxx").as_bytes()).unwrap();
+            let _reported = w.flush();
+        }
+        unblock_renames();
+        assert_history_intact(&dir, "a.log", 3);
+        assert_eq!(
+            read(&dir.file("a.log")),
+            "11111r0xxxr1xxxr2xxxr3xxxr4xxxr5xxx"
+        );
+        assert_eq!(
+            rotation_files(&dir),
+            ["a.log", "a.log.1", "a.log.2", "a.log.3"]
+        );
+    }
+
+    #[test]
+    fn test_rotating_file_blocked_history_rename_rolls_back() {
+        let dir = TempDir::new("blocked-history");
+        let mut w = seeded_writer(&dir, "h.log");
+        // The shift moves `.3` to the pruning name and then fails on
+        // `.2 -> .3`; both the prune and the staging move are undone.
+        block_rename(dir.file("h.log.2"), dir.file("h.log.3"));
+        w.write_all(b"r0xxx").unwrap();
+        let err = w.flush().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        unblock_renames();
+        assert_history_intact(&dir, "h.log", 3);
+        assert_eq!(read(&dir.file("h.log")), "11111r0xxx");
+        assert_eq!(
+            rotation_files(&dir),
+            ["h.log", "h.log.1", "h.log.2", "h.log.3"]
+        );
+    }
+
+    #[test]
+    fn test_rotating_file_blocked_final_rename_rolls_back() {
+        let dir = TempDir::new("blocked-final");
+        let mut w = seeded_writer(&dir, "s.log");
+        block_rename(dir.file("s.log.rotating"), dir.file("s.log.1"));
+        w.write_all(b"r0xxx").unwrap();
+        assert!(w.flush().is_err());
+        unblock_renames();
+        assert_history_intact(&dir, "s.log", 3);
+        assert_eq!(read(&dir.file("s.log")), "11111r0xxx");
+        // Unblocked, the next rotation completes.
+        w.rotate_now().unwrap();
+        w.write_all(b"r1xxx").unwrap();
+        w.flush().unwrap();
+        assert_eq!(read(&dir.file("s.log")), "r1xxx");
+        assert_eq!(read(&dir.file("s.log.1")), "11111r0xxx");
+        assert_eq!(read(&dir.file("s.log.2")), "OLD1\n");
+        assert_eq!(read(&dir.file("s.log.3")), "OLD2\n");
+        assert_eq!(
+            rotation_files(&dir),
+            ["s.log", "s.log.1", "s.log.2", "s.log.3"],
+            "OLD3 is pruned only by the rotation that completed"
+        );
+    }
+
+    #[test]
+    fn test_rotating_file_failed_rollback_deletes_nothing_and_stops_rotating() {
+        let dir = TempDir::new("blocked-rollback");
+        let mut w = seeded_writer(&dir, "r.log");
+        // Forward: the final staging rename fails. Rollback: undoing
+        // `.1 -> .2` fails too, so the rollback stops there.
+        block_rename(dir.file("r.log.rotating"), dir.file("r.log.1"));
+        block_rename(dir.file("r.log.2"), dir.file("r.log.1"));
+        w.write_all(b"r0xxx").unwrap();
+        assert!(w.flush().is_err());
+        unblock_renames();
+        let mut contents: Vec<String> = rotation_files(&dir)
+            .iter()
+            .map(|name| read(&dir.file(name)))
+            .collect();
+        contents.sort();
+        // Every record is still on disk under some name.
+        assert_eq!(contents, ["11111", "OLD1\n", "OLD2\n", "OLD3\n", "r0xxx"]);
+        assert_eq!(read(&dir.file("r.log.rotating")), "11111");
+        // With records stranded in the staging file, rotation refuses to
+        // run rather than overwrite it, and the new file keeps growing.
+        w.write_all(b"r1xxx").unwrap();
+        w.write_all(b"r2xxx").unwrap();
+        let err = w.flush().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(err.to_string().contains("r.log.rotating"), "{err}");
+        assert_eq!(read(&dir.file("r.log.rotating")), "11111");
+        assert_eq!(read(&dir.file("r.log")), "r0xxxr1xxxr2xxx");
+    }
+
+    fn seed_history(dir: &TempDir, base: &str, count: usize) {
+        for index in 1..=count {
+            fs::write(
+                dir.file(&format!("{base}.{index}")),
+                format!(
+                    "OLD{index}
+"
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    fn assert_history_intact(dir: &TempDir, base: &str, count: usize) {
+        for index in 1..=count {
+            assert_eq!(
+                read(&dir.file(&format!("{base}.{index}"))),
+                format!(
+                    "OLD{index}
+"
+                ),
+                "{base}.{index} must survive a failed rotation"
+            );
+        }
+    }
+
+    /// LOG-R01: a rename blocked by another process (Windows opens
+    /// without `FILE_SHARE_DELETE`) must not cost any rotated history,
+    /// no matter how often rotation is retried.
+    #[cfg(windows)]
+    #[test]
+    fn test_rotating_file_held_active_file_keeps_history_on_windows() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        let dir = TempDir::new("held");
+        let path = dir.file("held.log");
+        let mut w = RotatingFile::builder(&path)
+            .max_bytes(5)
+            .max_files(3)
+            .buffer_capacity(0)
+            .open()
+            .unwrap();
+        w.write_all(b"11111").unwrap();
+        seed_history(&dir, "held.log", 3);
+        let holder = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .unwrap();
+        let mut failures = 0;
+        for i in 0..6 {
+            w.write_all(format!("r{i}xxx").as_bytes()).unwrap();
+            if w.flush().is_err() {
+                failures += 1;
+            }
+        }
+        drop(holder);
+        assert!(failures > 0, "the blocked rotation must be reported");
+        assert_history_intact(&dir, "held.log", 3);
+        assert_eq!(read(&path), "11111r0xxxr1xxxr2xxxr3xxxr4xxxr5xxx");
+        assert!(!dir.file("held.log.4").exists());
+        // Once the other handle is gone, rotation resumes normally.
+        w.rotate_now().unwrap();
+        assert_eq!(
+            read(&dir.file("held.log.1")),
+            "11111r0xxxr1xxxr2xxxr3xxxr4xxxr5xxx"
+        );
+        assert_eq!(
+            read(&dir.file("held.log.2")),
+            "OLD1
+"
+        );
+        assert_eq!(
+            read(&dir.file("held.log.3")),
+            "OLD2
+"
+        );
+        assert!(!dir.file("held.log.4").exists(), "max_files still applies");
     }
 }
