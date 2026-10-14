@@ -518,9 +518,13 @@ mod tests {
     #[test]
     fn test_color_choice_default_is_auto() {
         assert_eq!(ColorChoice::default(), ColorChoice::Auto);
-        // Smoke-test the process-environment entry points.
-        let _stdout = ColorChoice::Never.enabled_for_stdout();
-        let _stderr = ColorChoice::Never.enabled_for_stderr();
+        // The process-environment entry points honour explicit choices
+        // regardless of the terminal and the environment.
+        assert!(ColorChoice::Always.enabled_for_stdout());
+        assert!(ColorChoice::Always.enabled_for_stderr());
+        assert!(!ColorChoice::Never.enabled_for_stdout());
+        assert!(!ColorChoice::Never.enabled_for_stderr());
+        assert!(ColorChoice::Always.resolve(false));
         assert!(!ColorChoice::Never.resolve(true));
     }
 }

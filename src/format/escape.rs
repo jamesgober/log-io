@@ -406,6 +406,21 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitized_key_rejects_keys_made_only_of_breaking_characters() {
+        // Each of these must leave the clean-ASCII fast path; keys that
+        // consist of nothing but one bad character exercise every
+        // condition of that check on its own.
+        for bad in [
+            "\n", " ", "\u{7f}", "=", "\"", "\u{85}", "\u{202e}", "\u{1}",
+        ] {
+            let n = bad.chars().count();
+            assert_eq!(key(bad), "_".repeat(n), "{bad:?}");
+            assert_eq!(key(&bad.repeat(3)), "_".repeat(3 * n), "{bad:?}");
+        }
+        assert_eq!(key("!~"), "!~", "printable ASCII bounds stay clean");
+    }
+
+    #[test]
     fn test_reserved_keys() {
         for k in ["timestamp", "level", "target", "message", "file", "line"] {
             assert!(is_reserved_key(k));

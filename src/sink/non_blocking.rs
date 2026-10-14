@@ -82,6 +82,11 @@ struct Channel {
 /// aborts are lost; see [`super::FileSink`] for the exit paths that
 /// skip destructors.
 ///
+/// The writer (and the worker's `on_error` handler) must not log
+/// through a logger that feeds this same sink: with
+/// [`Overflow::Block`], a full queue would make the worker wait for
+/// itself.
+///
 /// # Examples
 ///
 #[cfg_attr(all(feature = "json"), doc = "```")]
