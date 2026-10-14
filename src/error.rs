@@ -41,12 +41,16 @@ pub enum Error {
     /// from their own `fmt` implementation; it indicates a bug in that
     /// implementation or in a custom [`crate::format::Format`].
     Format(fmt::Error),
-    /// A custom sink or format rejected its configuration. Not produced
-    /// by the built-in components; available to implementors.
+    /// A sink or format rejected its configuration. Among the built-in
+    /// components only [`crate::sink::NonBlockingBuilder::build`]
+    /// returns it (for an invalid thread name); fix the configuration.
     Configuration(&'static str),
-    /// The sink has stopped accepting records: its background worker
-    /// exited (for example after the writer panicked). Records sent to
-    /// it are lost; rebuild the sink to recover.
+    /// The sink cannot serve the request. Either its background worker
+    /// exited (for example after the writer panicked), in which case
+    /// records sent to it are lost and the sink must be rebuilt; or a
+    /// flush or shutdown was requested from the sink's own worker
+    /// thread (its writer or `on_error` handler), which cannot wait for
+    /// itself.
     Closed,
     /// An error from a custom sink that does not fit the other
     /// variants. Construct with [`Error::custom`].

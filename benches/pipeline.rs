@@ -20,13 +20,16 @@
 //!   cost a typical user pays.
 //! * `macro_info` - the `info!` macro with three fields on the
 //!   default configuration.
+//! * `non_blocking_error_drop_newest` - an `Error` record (the default
+//!   flush level) through a `NonBlocking` sink with
+//!   `Overflow::DropNewest`: format, enqueue and hand off the flush.
 
 use std::hint::black_box;
 use std::io::{self, Write};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use log_io::format::{JsonFormat, LogfmtFormat};
-use log_io::sink::NullSink;
+use log_io::sink::{NonBlocking, NullSink, Overflow};
 use log_io::{Field, Level, Logger, Value, context};
 
 struct DevNull;
@@ -78,6 +81,15 @@ fn pipeline_benches(c: &mut Criterion) {
         Field::new("path", Value::Str("/api/users")),
     ];
 
+    let background = quiet()
+        .with_sink(
+            NonBlocking::builder(DevNull, JsonFormat::new())
+                .overflow(Overflow::DropNewest)
+                .build()
+                .expect("spawn the bench writer thread"),
+        )
+        .build();
+
     let mut group = c.benchmark_group("pipeline");
     group.bench_function("dispatch_only", |b| {
         b.iter(|| null.log(Level::Info, black_box("hello"), &fields));
@@ -122,7 +134,11 @@ fn pipeline_benches(c: &mut Criterion) {
             );
         });
     });
+    group.bench_function("non_blocking_error_drop_newest", |b| {
+        b.iter(|| background.log(Level::Error, black_box("hello"), &fields));
+    });
     group.finish();
+    background.shutdown().expect("drain the bench writer");
 }
 
 criterion_group!(benches, pipeline_benches);

@@ -519,7 +519,7 @@ impl Logger {
         }
         if record.metadata.level >= self.inner.flush_level {
             for sink in &self.inner.sinks {
-                if let Err(e) = sink.flush() {
+                if let Err(e) = sink.request_flush() {
                     self.report(&e);
                     if first.is_none() {
                         first = Some(e);

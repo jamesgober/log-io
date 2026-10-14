@@ -94,6 +94,26 @@ pub trait Sink: Send + Sync {
     /// an earlier background operation.
     fn flush(&self) -> Result<()>;
 
+    /// Flush triggered by a record at or above the logger's flush level
+    /// (see [`crate::LoggerBuilder::flush_on`]).
+    ///
+    /// The default implementation calls [`Sink::flush`], so the record
+    /// has reached the destination when the logging call returns. A
+    /// background sink may override it to hand the request to its
+    /// worker without waiting, when waiting would break its own latency
+    /// contract; [`NonBlocking`] does this under
+    /// [`Overflow::DropNewest`]. [`crate::Logger::flush`] and
+    /// [`crate::Logger::shutdown`] call [`Sink::flush`] and
+    /// [`Sink::shutdown`], never this method.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Sink::flush`]. A sink that does not wait can only
+    /// report errors it already knows about.
+    fn request_flush(&self) -> Result<()> {
+        self.flush()
+    }
+
     /// Flush and release background resources. Called by
     /// [`crate::Logger::shutdown`], by a [`crate::FlushGuard`] on drop,
     /// and when the last clone of a [`crate::Logger`] is dropped.
@@ -118,6 +138,9 @@ impl<S: Sink + ?Sized> Sink for std::sync::Arc<S> {
     fn flush(&self) -> Result<()> {
         (**self).flush()
     }
+    fn request_flush(&self) -> Result<()> {
+        (**self).request_flush()
+    }
     fn shutdown(&self) -> Result<()> {
         (**self).shutdown()
     }
@@ -129,6 +152,9 @@ impl<S: Sink + ?Sized> Sink for Box<S> {
     }
     fn flush(&self) -> Result<()> {
         (**self).flush()
+    }
+    fn request_flush(&self) -> Result<()> {
+        (**self).request_flush()
     }
     fn shutdown(&self) -> Result<()> {
         (**self).shutdown()
@@ -142,6 +168,7 @@ mod stdio;
 mod writer;
 
 pub use self::file::{FileSink, FileSinkBuilder};
+pub(crate) use self::non_blocking::on_background_worker;
 pub use self::non_blocking::{NonBlocking, NonBlockingBuilder, Overflow};
 pub use self::rotating::{RotatingFile, RotatingFileBuilder, Rotation};
 pub use self::stdio::{StderrSink, StdoutSink};

@@ -7,11 +7,13 @@
 //! the file. Run normally (without the variable), the `child_*` tests do
 //! nothing.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use log_io::format::JsonFormat;
-use log_io::sink::FileSink;
+use log_io::sink::{FileSink, NonBlocking};
 use log_io::{Level, Logger};
 
 const ROLE: &str = "LOG_IO_DURABILITY_CHILD";
@@ -155,4 +157,88 @@ fn panic_hook_logs_and_flushes() {
         panic["file"].as_str().unwrap().ends_with("durability.rs"),
         "{panic}"
     );
+}
+
+/// Run a `child_*` test, killing it if it has not exited after
+/// `limit`. Returns `None` if it had to be killed.
+fn run_child_with_timeout(test: &str, limit: Duration) -> Option<std::process::Output> {
+    let exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(exe)
+        .args([test, "--exact", "--nocapture", "--test-threads=1"])
+        .env(ROLE, test)
+        .env(PATH, std::env::temp_dir())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + limit;
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Some(child.wait_with_output().unwrap())
+}
+
+#[test]
+fn child_panic_on_background_worker_does_not_hang() {
+    if child_role().is_none() {
+        return;
+    }
+    /// Panics on its first write, on the sink's worker thread.
+    struct PanicsOnce(bool);
+    impl Write for PanicsOnce {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if !self.0 {
+                self.0 = true;
+                panic!("writer exploded on the worker");
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let sink = NonBlocking::builder(PanicsOnce(false), JsonFormat::new())
+        .buffer_capacity(0)
+        .build()
+        .unwrap();
+    let logger = Logger::builder()
+        .level(Level::Info)
+        .no_timestamps()
+        .with_sink(sink)
+        .build();
+    let _guard = log_io::init(logger).unwrap();
+    log_io::global::install_panic_hook();
+    log_io::info!("first record");
+    // Wait until the worker is gone and the sink reports `Closed`.
+    let logger = log_io::global::get().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while logger.try_log(Level::Info, "probe", "probe", &[]).is_ok() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    eprintln!("child: main returning");
+    // `_guard` drops here and shuts the sink down.
+}
+
+#[test]
+fn panic_on_background_worker_does_not_hang() {
+    // LOG-R02: with the panic hook installed, a panic on a `NonBlocking`
+    // worker used to make the hook wait for that same worker: the
+    // process hung forever and the panic message was never printed.
+    let out = run_child_with_timeout(
+        "child_panic_on_background_worker_does_not_hang",
+        Duration::from_secs(30),
+    )
+    .expect("the child process hung and was killed after 30 s");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        stderr.contains("writer exploded on the worker"),
+        "the original panic message must be printed: {stderr}"
+    );
+    assert!(stderr.contains("child: main returning"), "{stderr}");
 }

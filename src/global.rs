@@ -34,6 +34,7 @@ use crate::error::Result;
 use crate::level::Level;
 use crate::logger::{Logger, in_dispatch};
 use crate::record::{Field, Metadata};
+use crate::sink::on_background_worker;
 
 static GLOBAL: OnceLock<Logger> = OnceLock::new();
 
@@ -102,18 +103,29 @@ pub fn shutdown() -> Result<()> {
 ///
 /// The record is emitted at [`Level::Error`] with target `panic`, the
 /// panic message as its message, the panic location as its source
-/// location, and `thread` and `column` fields. Because the hook runs before unwinding (or before
-/// the process aborts under `panic = "abort"`), this preserves the
-/// final records that would otherwise sit in a buffer.
+/// location, and `thread` and `column` fields. Because the hook runs
+/// before unwinding (or before the process aborts under
+/// `panic = "abort"`), this preserves the final records that would
+/// otherwise sit in a buffer.
 ///
-/// If the panic happens inside the logging pipeline itself (in a sink or
-/// format on the panicking thread), the hook does not touch the logger,
-/// because the panicking frame may hold a sink's lock. Install it once,
-/// after [`init`]; installing it twice logs each panic twice.
+/// The hook does not touch the logger, and only runs the previous hook
+/// (which prints the panic message by default), when the panic happens
+/// inside the logging pipeline itself:
+///
+/// * in a sink or format on the panicking thread, because the
+///   panicking frame may hold a sink's lock;
+/// * on the background thread of a [`crate::sink::NonBlocking`] sink
+///   (its writer or `on_error` handler panicked), because flushing
+///   would wait for that same thread. The sink reports
+///   [`crate::Error::Closed`] afterwards and the process can still shut
+///   down.
+///
+/// Install it once, after [`init`]; installing it twice logs each panic
+/// twice.
 pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if !in_dispatch() {
+        if !in_dispatch() && !on_background_worker() {
             if let Some(logger) = GLOBAL.get() {
                 log_panic(logger, info);
             }

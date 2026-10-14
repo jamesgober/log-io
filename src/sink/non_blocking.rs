@@ -1,9 +1,10 @@
 //! Background-thread sink with a bounded queue.
 
+use core::cell::Cell;
 use std::io::{self, BufWriter, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, TryLockError};
 use std::thread::JoinHandle;
 
 use super::{Sink, lock_recover, trim_buffer};
@@ -17,10 +18,24 @@ use crate::record::Record;
 pub enum Overflow {
     /// Wait for space. No record is ever dropped; under sustained
     /// overload the logging threads slow down to the writer's pace.
+    ///
+    /// A record at or above the logger's flush level (see
+    /// [`crate::LoggerBuilder::flush_on`], default `Error`) waits until
+    /// everything queued before it has been written and the writer
+    /// flushed, so it has reached the OS when the logging call returns.
     #[default]
     Block,
     /// Drop the record that did not fit and count it (see
-    /// [`NonBlocking::dropped`]). Logging never waits on the writer.
+    /// [`NonBlocking::dropped`]).
+    ///
+    /// Logging never waits on the writer: a record at or above the
+    /// logger's flush level only queues a flush request for the worker
+    /// (skipped if the queue is full, since the worker flushes as soon
+    /// as it drains the queue), so it is not yet durable when the call
+    /// returns. Call [`crate::Logger::flush`] to wait. The one wait left
+    /// is on shutdown: while [`Sink::shutdown`] drains the queue,
+    /// records from other threads wait for it to finish and are then
+    /// written synchronously, so they are not lost.
     DropNewest,
 }
 
@@ -30,7 +45,23 @@ pub type WorkerErrorHandler = Arc<dyn Fn(&io::Error) + Send + Sync>;
 enum Message {
     Record(String),
     Flush(SyncSender<io::Result<()>>),
+    /// Flush without acknowledging; errors are reported like write
+    /// errors.
+    FlushRequest,
     Shutdown,
+}
+
+thread_local! {
+    /// Identity of the [`NonBlocking`] sink whose worker runs on this
+    /// thread (the address of its shared state), or `0`.
+    static WORKER_OF: Cell<usize> = const { Cell::new(0) };
+}
+
+/// `true` on the worker thread of any [`NonBlocking`] sink. The panic
+/// hook uses it to stay away from a sink whose worker is the thread
+/// that is panicking.
+pub(crate) fn on_background_worker() -> bool {
+    WORKER_OF.try_with(Cell::get).unwrap_or(0) != 0
 }
 
 struct Shared {
@@ -76,16 +107,28 @@ struct Channel {
 ///   `flush`.
 /// * **Allocation:** queued strings are recycled through a return
 ///   channel, so a single producer allocates only while the pool warms
-///   up; with heavy multi-thread contention some records allocate.
+///   up, which can take up to `capacity` records when the producer
+///   outruns the writer; with heavy multi-thread contention some
+///   records allocate. The pool keeps at most `capacity` buffers of up
+///   to 64 KiB each.
 ///
 /// As with any buffering sink, records still queued when the process
 /// aborts are lost; see [`super::FileSink`] for the exit paths that
 /// skip destructors.
 ///
-/// The writer (and the worker's `on_error` handler) must not log
-/// through a logger that feeds this same sink: with
-/// [`Overflow::Block`], a full queue would make the worker wait for
-/// itself.
+/// * **Flush level:** a record at or above the logger's flush level
+///   waits for the queue to drain under [`Overflow::Block`] and does
+///   not wait under [`Overflow::DropNewest`]; see [`Overflow`].
+///
+/// The writer and the worker's `on_error` handler may log through a
+/// logger that feeds this same sink, but the worker never waits for
+/// itself: on the worker thread, a record that does not fit in the
+/// queue is dropped and counted (even under [`Overflow::Block`]), a
+/// flush-level flush is skipped (the worker flushes once it drains the
+/// queue), and [`Sink::flush`] and [`Sink::shutdown`] return
+/// [`Error::Closed`] at once. Records written that way are delayed
+/// behind the current batch, and they feed the writer again, so keep
+/// such logging rare.
 ///
 /// # Examples
 ///
@@ -164,6 +207,53 @@ impl<F: Format> NonBlocking<F> {
             .unwrap_or_default()
     }
 
+    /// `true` when called on this sink's own worker thread.
+    fn on_own_worker(&self) -> bool {
+        let me = Arc::as_ptr(&self.shared).addr();
+        WORKER_OF.try_with(Cell::get).is_ok_and(|w| w == me)
+    }
+
+    fn count_drop(&self) {
+        let _previous = self.shared.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The channel state, or `None` when a shutdown in progress holds
+    /// it and waiting is not allowed.
+    fn channel(&self, may_wait: bool) -> Option<RwLockReadGuard<'_, Channel>> {
+        match self.channel.try_read() {
+            Ok(channel) => Some(channel),
+            Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            Err(TryLockError::WouldBlock) if may_wait => {
+                Some(self.channel.read().unwrap_or_else(PoisonError::into_inner))
+            }
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// Queue a flush for the worker without waiting for it.
+    fn queue_flush(&self) -> Result<()> {
+        // A shutdown in progress flushes everything anyway.
+        let Some(channel) = self.channel(false) else {
+            return Ok(());
+        };
+        if let Some(sender) = &channel.sender {
+            match sender.try_send(Message::FlushRequest) {
+                // Full: the worker is busy and flushes as soon as it
+                // drains the queue.
+                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Disconnected(_)) => return Err(Error::Closed),
+            }
+            drop(channel);
+            return self.take_deferred();
+        }
+        drop(channel);
+        // Shut down: late records are written synchronously.
+        if let Some(writer) = lock_recover(&self.fallback).as_mut() {
+            writer.flush()?;
+        }
+        self.take_deferred()
+    }
+
     fn take_deferred(&self) -> Result<()> {
         match lock_recover(&self.shared.deferred).take() {
             Some(e) => Err(Error::Io(e)),
@@ -180,23 +270,24 @@ impl<F: Format> Sink for NonBlocking<F> {
             .write_record_generic(record, &mut text)
             .map_err(Error::Format)?;
 
-        let channel = self
-            .channel
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The worker must never wait for itself: not for a shutdown that
+        // is joining it, and not for space in its own queue.
+        let Some(channel) = self.channel(!self.on_own_worker()) else {
+            self.count_drop();
+            return Ok(());
+        };
         if let Some(sender) = &channel.sender {
-            return match self.overflow {
-                Overflow::Block => sender
-                    .send(Message::Record(text))
-                    .map_err(|_| Error::Closed),
-                Overflow::DropNewest => match sender.try_send(Message::Record(text)) {
-                    Ok(()) => Ok(()),
-                    Err(TrySendError::Full(_)) => {
-                        let _previous = self.shared.dropped.fetch_add(1, Ordering::Relaxed);
+            return match sender.try_send(Message::Record(text)) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(message)) => {
+                    if matches!(self.overflow, Overflow::Block) && !self.on_own_worker() {
+                        sender.send(message).map_err(|_| Error::Closed)
+                    } else {
+                        self.count_drop();
                         Ok(())
                     }
-                    Err(TrySendError::Disconnected(_)) => Err(Error::Closed),
-                },
+                }
+                Err(TrySendError::Disconnected(_)) => Err(Error::Closed),
             };
         }
         drop(channel);
@@ -208,10 +299,11 @@ impl<F: Format> Sink for NonBlocking<F> {
     }
 
     fn flush(&self) -> Result<()> {
-        let channel = self
-            .channel
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.on_own_worker() {
+            // Waiting for the worker from the worker would never end.
+            return Err(Error::Closed);
+        }
+        let channel = self.channel.read().unwrap_or_else(PoisonError::into_inner);
         if let Some(sender) = &channel.sender {
             let (ack_tx, ack_rx) = mpsc::sync_channel(1);
             sender
@@ -229,11 +321,24 @@ impl<F: Format> Sink for NonBlocking<F> {
         self.take_deferred()
     }
 
+    fn request_flush(&self) -> Result<()> {
+        if self.on_own_worker() {
+            // The worker flushes once it has drained the queue.
+            return Ok(());
+        }
+        match self.overflow {
+            Overflow::DropNewest => self.queue_flush(),
+            // `Block` may wait by contract: make the record durable.
+            _ => self.flush(),
+        }
+    }
+
     fn shutdown(&self) -> Result<()> {
-        let mut channel = self
-            .channel
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.on_own_worker() {
+            // Joining the worker from the worker would never end.
+            return Err(Error::Closed);
+        }
+        let mut channel = self.channel.write().unwrap_or_else(PoisonError::into_inner);
         let Some(sender) = channel.sender.take() else {
             drop(channel);
             return self.flush();
@@ -286,10 +391,17 @@ pub struct NonBlockingBuilder<F> {
     on_error: Option<WorkerErrorHandler>,
 }
 
+/// Largest accepted queue capacity. The queue and the buffer pool
+/// preallocate one slot per record, so a larger value would only
+/// reserve memory (or overflow the allocation size).
+const MAX_CAPACITY: usize = 1 << 20;
+
 impl<F: Format> NonBlockingBuilder<F> {
-    /// Maximum number of queued records (minimum 1). Default 8192.
+    /// Maximum number of queued records. Default 8192. Values are
+    /// clamped to `1..=1_048_576` (2^20); the queue preallocates a slot
+    /// per record.
     pub fn capacity(mut self, records: usize) -> Self {
-        self.capacity = records.max(1);
+        self.capacity = records.clamp(1, MAX_CAPACITY);
         self
     }
 
@@ -306,7 +418,8 @@ impl<F: Format> NonBlockingBuilder<F> {
         self
     }
 
-    /// Name of the background thread. Default `log-io-writer`.
+    /// Name of the background thread. Default `log-io-writer`. The name
+    /// must not contain a NUL byte; [`Self::build`] rejects one.
     pub fn thread_name(mut self, name: impl Into<String>) -> Self {
         self.thread_name = name.into();
         self
@@ -322,8 +435,14 @@ impl<F: Format> NonBlockingBuilder<F> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] if the thread cannot be spawned.
+    /// Returns [`Error::Configuration`] if the thread name contains a
+    /// NUL byte, and [`Error::Io`] if the thread cannot be spawned.
     pub fn build(self) -> Result<NonBlocking<F>> {
+        if self.thread_name.contains(' ') {
+            return Err(Error::Configuration(
+                "NonBlocking thread name must not contain a NUL byte",
+            ));
+        }
         let (tx, rx) = mpsc::sync_channel::<Message>(self.capacity);
         let (pool_tx, pool_rx) = mpsc::sync_channel::<String>(self.capacity);
         let shared = Arc::new(Shared {
@@ -333,10 +452,14 @@ impl<F: Format> NonBlockingBuilder<F> {
             on_error: self.on_error,
         });
         let worker_shared = Arc::clone(&shared);
+        let identity = Arc::as_ptr(&shared).addr();
         let writer = BufWriter::with_capacity(self.buffer_capacity, self.writer);
         let worker = std::thread::Builder::new()
             .name(self.thread_name)
-            .spawn(move || run_worker(writer, &rx, &pool_tx, &worker_shared))?;
+            .spawn(move || {
+                WORKER_OF.with(|w| w.set(identity));
+                run_worker(writer, &rx, &pool_tx, &worker_shared)
+            })?;
         Ok(NonBlocking {
             format: self.format,
             overflow: self.overflow,
@@ -411,6 +534,12 @@ fn run_worker(
             Message::Flush(ack) => {
                 dirty = false;
                 let _requester_may_be_gone = ack.send(writer.flush());
+            }
+            Message::FlushRequest => {
+                dirty = false;
+                if let Err(e) = writer.flush() {
+                    report(shared, e);
+                }
             }
             Message::Shutdown => break,
         }
@@ -548,12 +677,13 @@ mod tests {
             .build()
             .unwrap();
         sink.write_record(&record("lost")).unwrap();
+        sink.write_record(&record("lost too")).unwrap();
         let err = sink.flush().unwrap_err();
         assert!(matches!(err, Error::Io(_)), "{err}");
-        assert_eq!(sink.write_errors(), 1);
-        assert_eq!(seen.load(Ordering::Relaxed), 1);
+        assert_eq!(sink.write_errors(), 2);
+        assert_eq!(seen.load(Ordering::Relaxed), 2);
         assert!(sink.flush().is_ok(), "the deferred error is reported once");
-        assert!(format!("{sink:?}").contains("write_errors: 1"));
+        assert!(format!("{sink:?}").contains("write_errors: 2"));
     }
 
     #[test]
@@ -603,5 +733,146 @@ mod tests {
         ));
         let builder = NonBlocking::builder(Vec::<u8>::new(), JsonFormat::new()).capacity(0);
         assert!(format!("{builder:?}").contains("capacity: 1"));
+    }
+
+    #[test]
+    fn test_non_blocking_builder_rejects_bad_options_without_panicking() {
+        // LOG-R07: both used to panic inside `build`.
+        let err = NonBlocking::builder(Vec::<u8>::new(), JsonFormat::new())
+            .thread_name("a b")
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, Error::Configuration(_)), "{err}");
+        let builder =
+            NonBlocking::builder(Vec::<u8>::new(), JsonFormat::new()).capacity(usize::MAX / 2);
+        assert!(format!("{builder:?}").contains("capacity: 1048576"));
+    }
+
+    /// Blocks its first write until `release` is signalled.
+    struct Stall(Option<mpsc::Receiver<()>>, Capture);
+    impl Write for Stall {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Some(gate) = self.0.take() {
+                let _released = gate.recv();
+            }
+            self.1.write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_non_blocking_drop_newest_flush_level_record_does_not_wait() {
+        // LOG-R03: with the default flush level, one error record used
+        // to wait until the whole queue was written.
+        let (release, gate) = mpsc::channel();
+        let out = Capture::default();
+        let sink = NonBlocking::builder(Stall(Some(gate), out.clone()), JsonFormat::new())
+            .capacity(4)
+            .overflow(Overflow::DropNewest)
+            .buffer_capacity(0)
+            .build()
+            .unwrap();
+        let logger = crate::Logger::builder()
+            .level(Level::Trace)
+            .no_timestamps()
+            .with_sink(sink)
+            .build();
+        for _ in 0..20 {
+            logger.log(Level::Info, "queued", &[]);
+        }
+        let (done, returned) = mpsc::channel();
+        let error_logger = logger.clone();
+        let handle = std::thread::spawn(move || {
+            error_logger.log(Level::Error, "error", &[]);
+            let _sent = done.send(());
+        });
+        let waited = returned.recv_timeout(std::time::Duration::from_secs(10));
+        release.send(()).unwrap();
+        handle.join().unwrap();
+        assert!(
+            waited.is_ok(),
+            "a flush-level record must not wait for the writer under DropNewest"
+        );
+        // An explicit flush still waits for everything queued.
+        logger.flush().unwrap();
+        assert!(out.lines() >= 1);
+    }
+
+    #[test]
+    fn test_non_blocking_worker_logging_into_its_own_sink_never_deadlocks() {
+        // The writer logs (at the flush level) through a logger that
+        // feeds this same sink, with a one-slot `Block` queue.
+        struct Echo {
+            logger: Arc<std::sync::OnceLock<crate::Logger>>,
+            echoes: usize,
+            flush_from_worker: Arc<Mutex<Option<bool>>>,
+        }
+        impl Write for Echo {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if let Some(logger) = self.logger.get() {
+                    if self.echoes < 50 {
+                        self.echoes += 1;
+                        logger.log(Level::Error, "echo from the writer", &[]);
+                        let closed = matches!(logger.flush(), Err(Error::Closed));
+                        *self.flush_from_worker.lock().unwrap() = Some(closed);
+                    }
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let cell = Arc::new(std::sync::OnceLock::new());
+        let flush_from_worker = Arc::new(Mutex::new(None));
+        let sink = NonBlocking::builder(
+            Echo {
+                logger: Arc::clone(&cell),
+                echoes: 0,
+                flush_from_worker: Arc::clone(&flush_from_worker),
+            },
+            JsonFormat::new(),
+        )
+        .capacity(1)
+        .buffer_capacity(0)
+        .build()
+        .unwrap();
+        let logger = crate::Logger::builder()
+            .level(Level::Trace)
+            .no_timestamps()
+            .with_sink(sink)
+            .build();
+        let _set = cell.set(logger.clone());
+        let (done, finished) = mpsc::channel();
+        let _detached = std::thread::spawn(move || {
+            for _ in 0..200 {
+                logger.log(Level::Info, "from a producer", &[]);
+            }
+            let shut = logger.shutdown();
+            let _sent = done.send(shut.is_ok());
+        });
+        let outcome = finished.recv_timeout(std::time::Duration::from_secs(30));
+        assert_eq!(outcome, Ok(true), "the worker waited for itself");
+        assert_eq!(
+            *flush_from_worker.lock().unwrap(),
+            Some(true),
+            "a flush from the worker thread reports `Closed` instead of waiting"
+        );
+        // The writer (now the sink's synchronous fallback) holds the
+        // logger that holds the sink: a deliberate cycle, leaked here.
+        drop(cell);
+    }
+
+    #[test]
+    fn test_non_blocking_drop_without_logger_drains_the_queue() {
+        let out = Capture::default();
+        let sink = NonBlocking::new(out.clone(), JsonFormat::new()).unwrap();
+        for _ in 0..100 {
+            sink.write_record(&record("x")).unwrap();
+        }
+        drop(sink);
+        assert_eq!(out.lines(), 100);
     }
 }

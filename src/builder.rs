@@ -239,6 +239,15 @@ impl LoggerBuilder {
     /// [`Level::Error`], so errors reach the OS before the logging call
     /// returns. [`Level::Off`] disables flush-on-level; [`Level::Trace`]
     /// flushes after every record.
+    ///
+    /// The flush goes through [`Sink::request_flush`]. The built-in
+    /// synchronous sinks flush before the call returns. A
+    /// [`crate::sink::NonBlocking`] sink with
+    /// [`crate::sink::Overflow::Block`] also waits, until its queue has
+    /// been written and flushed; with
+    /// [`crate::sink::Overflow::DropNewest`] it only queues the request
+    /// and returns at once, so the record is not yet durable when the
+    /// call returns. Call [`Logger::flush`] when you need that.
     pub fn flush_on(mut self, level: Level) -> Self {
         self.flush_level = level;
         self
