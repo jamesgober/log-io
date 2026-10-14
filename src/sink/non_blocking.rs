@@ -438,7 +438,7 @@ impl<F: Format> NonBlockingBuilder<F> {
     /// Returns [`Error::Configuration`] if the thread name contains a
     /// NUL byte, and [`Error::Io`] if the thread cannot be spawned.
     pub fn build(self) -> Result<NonBlocking<F>> {
-        if self.thread_name.contains(' ') {
+        if self.thread_name.contains('\0') {
             return Err(Error::Configuration(
                 "NonBlocking thread name must not contain a NUL byte",
             ));
@@ -739,7 +739,7 @@ mod tests {
     fn test_non_blocking_builder_rejects_bad_options_without_panicking() {
         // LOG-R07: both used to panic inside `build`.
         let err = NonBlocking::builder(Vec::<u8>::new(), JsonFormat::new())
-            .thread_name("a b")
+            .thread_name("a\0b")
             .build()
             .unwrap_err();
         assert!(matches!(err, Error::Configuration(_)), "{err}");

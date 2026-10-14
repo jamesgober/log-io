@@ -30,7 +30,7 @@
 </p>
 
 <p>
-    It focuses on the properties that are easy to get wrong in a logger. The steady-state hot path performs no heap allocation, which a counting-allocator test enforces. Every format escapes control characters, line separators and bidi overrides, so a hostile request path cannot drive your terminal or forge log lines, and a field named <code>level</code> cannot override the real level. Error records are flushed before the call returns, and a guard flushes everything else at the end of <code>main</code>, so the last lines before a crash are on disk.
+    It focuses on the properties that are easy to get wrong in a logger. The steady-state hot path performs no heap allocation, which a counting-allocator test enforces. Every format escapes control characters, line separators and bidi overrides, so a hostile request path cannot drive your terminal or forge log lines, and a field named <code>level</code> cannot override the real level. Error records are flushed before the call returns (a <code>NonBlocking</code> sink with <code>DropNewest</code> only queues that flush, so it never waits), and a guard flushes everything else at the end of <code>main</code>, so the last lines before a crash are on disk.
 </p>
 
 <p>

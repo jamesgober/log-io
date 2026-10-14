@@ -55,8 +55,11 @@
 //! # Durability
 //!
 //! Records at or above the flush level (default [`Level::Error`]) are
-//! flushed to every sink before the logging call returns. Everything
-//! else may sit in a buffer until a flush, a [`FlushGuard`] drop, or the
+//! flushed to every sink before the logging call returns. The one
+//! exception is a [`sink::NonBlocking`] sink with
+//! [`Overflow::DropNewest`](sink::Overflow::DropNewest): it only queues
+//! that flush so the call never waits, and a [`FlushGuard`] drop or
+//! [`Logger::flush`] still drains it. Everything else may sit in a buffer until a flush, a [`FlushGuard`] drop, or the
 //! last [`Logger`] clone being dropped. See [`sink::FileSink`] for the
 //! exit paths that lose buffered data and how to avoid them.
 //!
