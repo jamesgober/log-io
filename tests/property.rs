@@ -87,7 +87,11 @@ impl Owned {
             Self::Str(s) | Self::Display(s) => Some(s.clone()),
             Self::Debug(s) => Some(format!("{s:?}")),
             Self::Char(c) => Some(c.to_string()),
-            Self::Bytes(b) => Some(b.iter().map(|x| format!("{x:02x}")).collect()),
+            Self::Bytes(b) => Some(b.iter().fold(String::new(), |mut hex, x| {
+                use std::fmt::Write as _;
+                let _ = write!(hex, "{x:02x}");
+                hex
+            })),
             _ => None,
         }
     }
