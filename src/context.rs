@@ -60,6 +60,19 @@
 //!     handle_request().await; // every record carries the captured fields
 //! }));
 //! ```
+//!
+//! `!Send` only helps where the executor requires `Send`. Futures that
+//! share one thread without that requirement (`join!` or `select!`
+//! inside a task, `LocalSet` / `spawn_local`, `block_on`) can each hold
+//! a guard across an `.await`, and an unwrapped future that does so
+//! leaves its fields on the thread while it is suspended: every future
+//! polled on that thread in the meantime logs them. Wrap such futures
+//! with [`ContextSnapshot::wrap`] (use `ContextSnapshot::default()` when
+//! there is nothing to capture). A wrapped future keeps the guards it
+//! holds across an `.await` with itself between polls, so its fields
+//! are visible exactly while it is being polled. The rule of thumb:
+//! never hold a [`ContextGuard`] across an `.await` in a future that is
+//! not wrapped.
 
 use core::cell::{Cell, RefCell};
 use core::future::Future;
@@ -68,7 +81,7 @@ use core::pin::Pin;
 use core::task::{Context as TaskContext, Poll};
 use std::sync::Arc;
 
-use crate::record::Field;
+use crate::record::{Field, same_output_key};
 use crate::value::{OwnedField, Value};
 
 /// Maximum number of context fields attached to one record, and the
@@ -318,7 +331,10 @@ fn materialize<'e>(entries: &'e [Entry], buf: &mut [Field<'e>; MAX_CONTEXT_SLOTS
             if len == MAX_CONTEXT_SLOTS {
                 break 'entries;
             }
-            if buf[..len].iter().any(|f| f.key == &*owned.key) {
+            if buf[..len]
+                .iter()
+                .any(|f| same_output_key(f.key, &owned.key))
+            {
                 continue;
             }
             buf[len] = owned.as_field();
@@ -402,7 +418,10 @@ impl ContextSnapshot {
         }
         let mut owned: Vec<OwnedField> = Vec::with_capacity(fields.len());
         for field in fields {
-            if let Some(existing) = owned.iter_mut().find(|o| &*o.key == field.key) {
+            if let Some(existing) = owned
+                .iter_mut()
+                .find(|o| same_output_key(&o.key, field.key))
+            {
                 *existing = OwnedField::new(field.key, field.value);
             } else {
                 owned.push(OwnedField::new(field.key, field.value));
@@ -456,13 +475,52 @@ impl ContextSnapshot {
     ///
     /// Works with any executor, including work-stealing ones: whichever
     /// thread polls the future sees the snapshot for exactly the
-    /// duration of the poll. The future is boxed once (one allocation
-    /// per wrapped future) so the wrapper can be `Unpin` without
-    /// `unsafe` code.
+    /// duration of the poll.
+    ///
+    /// Context the future itself pushes and holds across an `.await`
+    /// (a [`ContextGuard`] alive in the future's state) is taken off the
+    /// thread when the poll returns `Pending` and put back at the start
+    /// of the next poll, so other futures polled on the same thread do
+    /// not see it. Such a future is `!Send`, so it always resumes on the
+    /// thread that created the guard.
+    ///
+    /// The future is boxed once (one allocation per wrapped future) so
+    /// the wrapper can be `Unpin` without `unsafe` code; holding context
+    /// across an `.await` allocates once more, on first use.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::future::Future;
+    /// use std::pin::pin;
+    /// use std::task::{Context, Poll, Waker};
+    /// use log_io::context::{self, ContextSnapshot};
+    ///
+    /// /// Returns `Pending` once, like an `.await` on I/O.
+    /// struct YieldOnce(bool);
+    /// impl Future for YieldOnce {
+    ///     type Output = ();
+    ///     fn poll(mut self: std::pin::Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+    ///         if self.0 { Poll::Ready(()) } else { self.0 = true; Poll::Pending }
+    ///     }
+    /// }
+    ///
+    /// let mut task = pin!(ContextSnapshot::default().wrap(async {
+    ///     let _tenant = context::with_field("tenant", "a");
+    ///     YieldOnce(false).await;
+    ///     assert_eq!(context::len(), 1); // back while this future runs
+    /// }));
+    /// let mut cx = Context::from_waker(Waker::noop());
+    /// assert!(task.as_mut().poll(&mut cx).is_pending());
+    /// assert_eq!(context::len(), 0); // not visible to anything else
+    /// assert!(task.as_mut().poll(&mut cx).is_ready());
+    /// ```
     pub fn wrap<F: Future>(&self, future: F) -> WithContext<F> {
         WithContext {
             future: Box::pin(future),
             snapshot: self.clone(),
+            held: Vec::new(),
+            held_ids: Vec::new(),
         }
     }
 }
@@ -481,6 +539,11 @@ impl core::fmt::Debug for ContextSnapshot {
 pub struct WithContext<F> {
     future: Pin<Box<F>>,
     snapshot: ContextSnapshot,
+    /// Context entries the future pushed and still holds, kept here
+    /// while it is suspended.
+    held: Vec<Entry>,
+    /// Ids of `held` while they are installed during a poll.
+    held_ids: Vec<u64>,
 }
 
 impl<F: Future> Future for WithContext<F> {
@@ -488,9 +551,65 @@ impl<F: Future> Future for WithContext<F> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
-        let _guard = this.snapshot.attach();
-        this.future.as_mut().poll(cx)
+        // Entries created on this thread from now on have ids >= this.
+        let first_new_id = CONTEXT.try_with(|ctx| ctx.next_id.get()).unwrap_or(0);
+        let snapshot_guard = this.snapshot.attach();
+        reinstall(&mut this.held, &mut this.held_ids);
+        let poll = this.future.as_mut().poll(cx);
+        if poll.is_pending() && first_new_id != 0 {
+            take_task_entries(
+                first_new_id,
+                snapshot_guard.id,
+                &this.held_ids,
+                &mut this.held,
+            );
+        }
+        drop(snapshot_guard);
+        poll
     }
+}
+
+/// Push entries kept by a suspended [`WithContext`] back onto the
+/// thread, remembering their ids.
+fn reinstall(held: &mut Vec<Entry>, held_ids: &mut Vec<u64>) {
+    held_ids.clear();
+    if held.is_empty() {
+        return;
+    }
+    let _tls_may_be_gone = CONTEXT.try_with(|ctx| {
+        for entry in held.drain(..) {
+            held_ids.push(entry.id());
+            ctx.apply_or_defer(Pending::Push(entry));
+        }
+    });
+}
+
+/// Move the entries a future pushed during its poll (new ids other than
+/// its snapshot's, plus the ones reinstalled for it) off the thread.
+fn take_task_entries(
+    first_new_id: u64,
+    snapshot_id: u64,
+    reinstalled: &[u64],
+    held: &mut Vec<Entry>,
+) {
+    let _tls_may_be_gone = CONTEXT.try_with(|ctx| {
+        // Borrowed only while a snapshot is being read (a poll from
+        // inside a sink); leave the entries in place then.
+        let Ok(mut entries) = ctx.entries.try_borrow_mut() else {
+            return;
+        };
+        let mut index = 0;
+        while index < entries.len() {
+            let id = entries[index].id();
+            let owned_by_task =
+                (id >= first_new_id && id != snapshot_id) || reinstalled.contains(&id);
+            if owned_by_task {
+                held.push(entries.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+    });
 }
 
 impl<F> core::fmt::Debug for WithContext<F> {
@@ -755,6 +874,98 @@ mod tests {
         .join()
         .unwrap();
         assert_eq!(out, Poll::Ready(1));
+    }
+
+    /// Returns `Pending` once.
+    struct YieldOnce(bool);
+    impl Future for YieldOnce {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<()> {
+            if self.0 {
+                Poll::Ready(())
+            } else {
+                self.0 = true;
+                Poll::Pending
+            }
+        }
+    }
+
+    /// Poll `a` and `b` alternately on this thread until both finish, as
+    /// `join!` or a `LocalSet` does.
+    fn join_on_this_thread<'a>(
+        a: Pin<&'a mut dyn Future<Output = ()>>,
+        b: Pin<&'a mut dyn Future<Output = ()>>,
+    ) {
+        let mut cx = TaskContext::from_waker(std::task::Waker::noop());
+        let (mut a, mut b) = (Some(a), Some(b));
+        while a.is_some() || b.is_some() {
+            for slot in [&mut a, &mut b] {
+                if let Some(fut) = slot.as_mut() {
+                    if fut.as_mut().poll(&mut cx).is_ready() {
+                        *slot = None;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_wrapped_future_keeps_held_context_from_sibling_futures() {
+        // LOG-R04: future A holds a guard across an `.await` while its
+        // sibling B is polled on the same thread.
+        clear();
+        let seen_by_b = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let seen_by_a = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let (log_b, log_a) = (seen_by_b.clone(), seen_by_a.clone());
+        let task = ContextSnapshot::from_fields(&[Field::new("req", "r1")]);
+        let a = core::pin::pin!(task.wrap(async move {
+            let _tenant = with_field("tenant", "A");
+            YieldOnce(false).await;
+            log_a.borrow_mut().push(keys());
+            {
+                let _nested = ContextSnapshot::from_fields(&[Field::new("n", 1_u8)]).attach();
+                YieldOnce(false).await;
+                log_a.borrow_mut().push(keys());
+            }
+            YieldOnce(false).await;
+            log_a.borrow_mut().push(keys());
+        }));
+        let b = core::pin::pin!(async move {
+            for _ in 0..4 {
+                log_b.borrow_mut().push(keys());
+                YieldOnce(false).await;
+            }
+        });
+        join_on_this_thread(a, b);
+        for seen in seen_by_b.borrow().iter() {
+            assert!(seen.is_empty(), "B saw A's context: {seen:?}");
+        }
+        assert_eq!(
+            *seen_by_a.borrow(),
+            [
+                vec!["req", "tenant"],
+                vec!["req", "tenant", "n"],
+                vec!["req", "tenant"],
+            ]
+        );
+        assert_eq!(len(), 0, "nothing is left on the thread");
+    }
+
+    #[test]
+    fn test_wrapped_future_dropped_while_suspended_leaves_nothing() {
+        clear();
+        let mut cx = TaskContext::from_waker(std::task::Waker::noop());
+        let mut task = Box::pin(ContextSnapshot::default().wrap(async {
+            let _held = with_field("held", 1_u8);
+            YieldOnce(false).await;
+        }));
+        assert!(task.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(len(), 0);
+        drop(task);
+        assert_eq!(len(), 0);
+        let _outer = with_field("outer", 1_u8);
+        assert_eq!(keys(), ["outer"]);
+        clear();
     }
 
     #[test]

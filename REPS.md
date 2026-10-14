@@ -31,7 +31,8 @@ shutdown. Usable on its own or as the output stage for the `log` and
    redaction, and dispatches the record to each sink in order.
 3. Each sink serializes the record with its format and delivers it.
 4. Records at or above the flush level are flushed before the call
-   returns; shutdown drains and flushes every sink.
+   returns (a `NonBlocking` sink under `Overflow::DropNewest` queues the
+   flush instead of waiting); shutdown drains and flushes every sink.
 
 The built-in synchronous sinks write on the caller's thread.
 `sink::NonBlocking` moves I/O to a background thread with a bounded
@@ -64,7 +65,8 @@ rustdoc on docs.rs is authoritative for signatures. Summary:
 
 - `Logger`, `LoggerBuilder`, `BuildError`, `ErrorHandler`, `REDACTED`
 - `Filter`, `FilterRule`, `ParseFilterError`, `ParseFilterErrorKind`
-- `Sink` (`write_record`, `flush`, provided `shutdown`)
+- `Sink` (`write_record`, `flush`, provided `request_flush` and
+  `shutdown`)
 - `sink::{StdoutSink, StderrSink, FileSink, FileSinkBuilder,
   WriterSink, NullSink, NonBlocking, NonBlockingBuilder, Overflow,
   RotatingFile, RotatingFileBuilder, Rotation, RotatingFileSink}`

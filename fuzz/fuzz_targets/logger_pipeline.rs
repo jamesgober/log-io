@@ -6,12 +6,17 @@
 //! * never panics;
 //! * every emitted line is valid JSON whose level and message are the
 //!   record's own (no field can spoof them);
-//! * redacted keys never leak their value.
+//! * redacted keys never leak their value;
+//! * no key appears twice in a record (call-site duplicates included).
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
+use std::collections::HashSet;
+use std::fmt;
+
 use arbitrary::Arbitrary;
+use serde::de::{self, Deserializer, IgnoredAny, MapAccess, Visitor};
 use libfuzzer_sys::fuzz_target;
 use log_io::format::JsonFormat;
 use log_io::{Field, Level, Logger, context};
@@ -23,6 +28,33 @@ struct Input {
     context: Vec<(String, String)>,
     calls: Vec<(String, Vec<(String, FuzzValue)>)>,
     secret: String,
+}
+
+/// Deserializes a JSON object, failing if a key appears twice
+/// (`serde_json::Value` would silently keep the last one).
+struct UniqueKeys;
+
+impl<'de> de::Deserialize<'de> for UniqueKeys {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Keys;
+        impl<'de> Visitor<'de> for Keys {
+            type Value = UniqueKeys;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<UniqueKeys, A::Error> {
+                let mut seen = HashSet::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    let _: IgnoredAny = map.next_value()?;
+                    if !seen.insert(key.clone()) {
+                        return Err(de::Error::custom(format!("duplicate key {key:?}")));
+                    }
+                }
+                Ok(UniqueKeys)
+            }
+        }
+        deserializer.deserialize_map(Keys)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -70,6 +102,7 @@ fuzz_target!(|input: Input| {
     for (message, _) in &input.calls {
         let line = lines.next().expect("one line per call");
         let v: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
+        let _unique: UniqueKeys = serde_json::from_str(line).expect("unique keys");
         assert_eq!(v["level"], "warn");
         assert_eq!(v["message"].as_str(), Some(message.as_str()));
         assert_eq!(v["password"], "[REDACTED]");

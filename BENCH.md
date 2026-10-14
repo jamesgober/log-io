@@ -93,6 +93,40 @@ lock and unlock stalled all threads. Beyond roughly 8 threads one
 shared sink mutex still serializes writes; use `NonBlocking` (one
 writer thread) or one sink per thread group for more.
 
+## Re-audit fixes (2026-10-14)
+
+Interleaved A/B on the same machine and toolchain family (rustc 1.99.0,
+thin LTO): one probe compiled against `0139f53` (2.0.0 as first
+audited) and against the fixed tree, run alternately 8 times, minimum
+of 60 batches of 20,000 calls per case. Same 3 call-site fields as the
+pipeline table.
+
+| Case | before | after | Change |
+|---|---:|---:|---:|
+| `NullSink` (no formatting) | 7.4 ns | 10.1 ns | +2.7 ns |
+| `NullSink`, 8 fields | 7.5 ns | 15.3 ns | +7.8 ns |
+| JSON writer | 60.3 ns | 62.0 ns | +2.8% |
+| JSON writer, no fields | 29.5 ns | 29.3 ns | -0.6% |
+| logfmt writer | 51.8 ns | 55.3 ns | +6.7% |
+| 2 default fields | 88.4 ns | 89.0 ns | +0.6% |
+| context capture, 2 fields | 97.4 ns | 101.8 ns | +4.6% |
+| default configuration | 109.2 ns | 110.2 ns | +0.9% |
+| `info!` macro, default configuration | 134.6 ns | 133.3 ns | -1.0% |
+| `Error` record, `NonBlocking` + `DropNewest` | 960 ns | 151 ns | -84% |
+
+- **Flush-level records under `DropNewest`** (LOG-R03) no longer wait
+  for the worker. Behind a writer that takes 5 ms per write with a
+  64-record queue, one `error!` took 341-347 ms before and 1-3 µs
+  after (5 runs each). The criterion case
+  `pipeline/non_blocking_error_drop_newest` tracks the hand-off.
+- **Call-site key de-duplication** (LOG-R06) costs about 1 ns per
+  call-site field: one pass over the keys that hashes the last two
+  bytes of each into a 64-bit set, with a full comparison only on a
+  hash collision. That exceeds the 5% gate on the two cheapest paths
+  (`NullSink`, logfmt). Accepted: writing a key twice produces JSON
+  whose meaning depends on the parser (RFC 8259 leaves duplicate names
+  undefined), and on realistic configurations the cost is within noise.
+
 ## Allocation
 
 `tests/alloc.rs` counts allocations per thread with a counting global

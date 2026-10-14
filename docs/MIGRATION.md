@@ -83,6 +83,12 @@ the built-in formats and sinks need at most three edits:
   std::thread::spawn(move || snapshot.scope(|| work()));
   ```
 
+- On executors that do not require `Send` (`join!` / `select!` within a
+  task, `LocalSet`, `block_on`), the compiler cannot catch a guard held
+  across an `.await`. Wrap such futures with `ContextSnapshot::wrap`
+  (`ContextSnapshot::default().wrap(..)` if there is nothing to
+  capture): a wrapped future keeps the context it holds to itself while
+  it is suspended. An unwrapped one leaks it to its sibling futures.
 - An inner `with_field` with the same key now **shadows** the outer one
   (the record carries the key once, with the inner value).
 - `context::len()` counts the fields a record would carry, after

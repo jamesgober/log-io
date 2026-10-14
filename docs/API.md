@@ -42,7 +42,9 @@ caller --> Logger --> Filter --> assemble --> Sink #0 --> Format --> destination
 - Each **sink** formats the record and writes it. A failing sink does
   not stop the others.
 - Records at or above the **flush level** (default `Error`) are flushed
-  to every sink before the call returns.
+  to every sink before the call returns. The one exception is a
+  `NonBlocking` sink with `Overflow::DropNewest`, which never waits: it
+  queues the flush for its worker instead (see `NonBlocking` below).
 
 ## Feature flags
 
@@ -340,12 +342,12 @@ supported.
 | `filter(Filter)` / `target_level(t, l)` | | replace the filter / add a rule |
 | `filter_directive(&str)` | | parse a directive; invalid ones are reported by `try_build` |
 | `try_filter_directive(&str)` | | same, failing immediately |
-| `env_filter(var)` | | directive from an environment variable; unset or blank keeps the current filter |
+| `env_filter(var)` | | directive from an environment variable; unset or blank keeps the current filter, a set value replaces it entirely (`info,app::db=debug`, not just `app::db=debug`) |
 | `default_target(t)` | `""` | target used by `Logger::log` |
 | `no_timestamps()` / `no_context()` | on / on | skip the clock / thread context |
 | `with_default_field(k, v)` | | field on every record (same key replaces) |
 | `flush_on(Level)` | `Error` | flush every sink after records at or above it; `Off` disables |
-| `redact_key(k)` / `redact_common_secrets()` | none | replace values with `[REDACTED]` |
+| `redact_key(k)` / `redact_common_secrets()` | none | replace values with `[REDACTED]`; case-insensitive, `-` matches `_` (`x-api-key`), last dotted segment matches |
 | `on_error(handler)` | none | callback for sink, flush and format errors |
 | `with_sink`, `writer`, `stdout`, `stderr` | | install sinks |
 | `stdout_json`, `stderr_logfmt`, `stdout_human`, ... | | shortcuts per built-in format |
@@ -398,8 +400,12 @@ receives the record.
 Ambient fields are, in increasing precedence: default fields, thread
 context, integration context (for example `tracing` span fields), and
 finally the call-site fields. Each key appears once; the highest
-precedence wins. Redaction applies to all of them and never evaluates a
-lazy value it replaces.
+precedence wins, and among call-site fields with the same key the last
+one wins. Keys that the JSON and logfmt formats would write identically
+also count as duplicates: a `level` field is written as `fields.level`,
+so it collides with a `fields.level` field. A `Record` handed straight
+to a `Format` (without a logger) is written as given. Redaction applies
+to all of them and never evaluates a lazy value it replaces.
 
 ```rust
 use std::io::Write;
@@ -467,14 +473,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `global::get()`, `global::flush()`, `global::shutdown()`.
 - `global::install_panic_hook()` logs each panic (target `panic`, the
   panic message, location, thread name) and flushes, then runs the
-  previous hook. It does nothing when the panic happened inside a sink
-  on the same thread, where touching the logger could deadlock.
+  previous hook. It only runs the previous hook (which prints the panic
+  message) when the panic happened inside a sink on the same thread, or
+  on a `NonBlocking` worker thread: touching the logger there would
+  deadlock.
 
 ## Durability
 
 | Situation | Buffered records |
 |---|---|
-| record at or above the flush level (default `Error`) | flushed before the call returns, with everything buffered before it |
+| record at or above the flush level (default `Error`) | flushed before the call returns, with everything buffered before it (a `NonBlocking` sink with `DropNewest` only queues the flush) |
 | `Logger::flush` / `shutdown`, `global::flush` / `shutdown` | flushed |
 | `FlushGuard` dropped (end of `main`) | flushed, background sinks drained |
 | last `Logger` clone dropped | flushed, background sinks drained |
@@ -496,6 +504,7 @@ writes every record through immediately.
 pub trait Sink: Send + Sync {
     fn write_record(&self, record: &Record<'_>) -> Result<()>;
     fn flush(&self) -> Result<()>;
+    fn request_flush(&self) -> Result<()> { self.flush() } // flush-level records
     fn shutdown(&self) -> Result<()> { self.flush() }
 }
 ```
@@ -537,11 +546,23 @@ let logger = Logger::builder().writer(file, JsonFormat::new()).build();
 
 Rotation renames `app.jsonl` to `app.jsonl.1` (shifting older files up)
 between records, never inside one. The handle is closed before renaming,
-which makes it work on Windows. If a rename fails (another process
-holding the file open without delete sharing), the writer keeps
-appending to the current file, retries later, and reports the error from
-the next `flush`. Records are never lost to a failed rotation.
-`Rotation::{Never, Minutely, Hourly, Daily}`; periods are UTC.
+which makes it work on Windows. `Rotation::{Never, Minutely, Hourly,
+Daily}`; periods are UTC.
+
+A rotation is all or nothing. The active file is first moved to
+`app.jsonl.rotating`, so a file held open by another process (on
+Windows, without delete sharing) is detected before any history file is
+touched; the oldest file is moved to `app.jsonl.pruning` and deleted
+only after every other rename has succeeded; a failed rename undoes the
+ones before it. So a failed rotation never deletes or overwrites rotated
+history. The writer keeps appending to the current file, retries after
+another `max_bytes` or at the next period, and reports the error from
+the next `flush`. If the undo fails too (a second fault), nothing is
+deleted either: the records stay in `app.jsonl.rotating`, and later
+rotations report `AlreadyExists` until that file is moved away.
+
+Behind a `NonBlocking` sink the file receives the worker's batches, so
+it can exceed `max_bytes` by up to the worker's `buffer_capacity`.
 
 ### `NonBlocking`
 
@@ -564,13 +585,25 @@ logger.shutdown()?; // drains the queue and joins the worker
 - Records are formatted on the calling thread and written by a
   background thread, which flushes whenever its queue drains.
 - `flush` waits until everything queued before it is written.
+- A record at or above the logger's flush level waits for the same
+  under `Overflow::Block`. Under `Overflow::DropNewest` logging never
+  waits on the writer: the record only queues a flush request (skipped
+  when the queue is full), so call `Logger::flush` when you need the
+  record on disk.
+- The writer and the worker's `on_error` handler may log into the same
+  sink; the worker never waits for itself (such records are dropped and
+  counted when the queue is full, and `flush` / `shutdown` from the
+  worker return `Error::Closed`).
 - After `shutdown`, records are written synchronously, so late records
   from other threads are kept.
 - Worker write errors are counted (`write_errors()`), passed to the
   builder's `on_error` handler on the worker thread, and returned by the
   next `flush`. Drops under `DropNewest` are counted (`dropped()`).
 - Queued strings are recycled, so a single producer does not allocate
-  in steady state; under heavy contention some records allocate.
+  in steady state (the pool can take up to `capacity` records to warm
+  up); under heavy contention some records allocate.
+- `capacity` is clamped to `1..=1_048_576`; a thread name containing a
+  NUL byte makes `build` return `Error::Configuration`.
 
 ### Writing a sink
 
@@ -659,7 +692,19 @@ let future = explicit.wrap(async { /* every poll sees tenant=acme */ });
 
 `ContextSnapshot::wrap` re-installs the snapshot around every poll, so
 it works with any executor, including work-stealing ones. It boxes the
-future once.
+future once. Context that the wrapped future pushes and holds across an
+`.await` is kept with the future between polls, so it is visible only
+while that future runs.
+
+`!Send` guards only help where the executor requires `Send`. Futures
+that share a thread without that requirement (`join!` or `select!`
+inside one task, `LocalSet` / `spawn_local`, `block_on`) can hold a
+guard across an `.await`; if such a future is not wrapped, its fields
+stay on the thread while it is suspended and every sibling future logs
+them. Never hold a `ContextGuard` across an `.await` in a future that
+is not wrapped with `ContextSnapshot::wrap` (use
+`ContextSnapshot::default().wrap(..)` when there is nothing to
+capture).
 
 ## Macros
 

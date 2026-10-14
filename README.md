@@ -228,7 +228,7 @@ Run one with `cargo run --example 02_macros` (add `--features log` or
 
 <details>
   <summary><b>My last log lines are missing after the program exits.</b></summary>
-    <p>A logger stored in a <code>static</code> is never dropped. Keep the guard from <code>log_io::init</code> alive until the end of <code>main</code>, and call <code>log_io::global::shutdown()</code> before <code>std::process::exit</code>. Records at <code>Level::Error</code> and above are always flushed immediately.</p>
+    <p>A logger stored in a <code>static</code> is never dropped. Keep the guard from <code>log_io::init</code> alive until the end of <code>main</code>, and call <code>log_io::global::shutdown()</code> before <code>std::process::exit</code>. Records at <code>Level::Error</code> and above are flushed immediately (a <code>NonBlocking</code> sink with <code>Overflow::DropNewest</code> only queues that flush, so it never waits).</p>
 </details>
 
 <details>
@@ -238,7 +238,7 @@ Run one with `cargo run --example 02_macros` (add `--features log` or
 
 <details>
   <summary><b>Context set in an async handler is missing or appears in other requests.</b></summary>
-    <p>Context is per thread, and a guard cannot be held across <code>.await</code> in a multi-threaded runtime (it is <code>!Send</code>). Capture a snapshot with <code>context::capture()</code> and wrap the future with <code>snapshot.wrap(..)</code>.</p>
+    <p>Context is per thread, and a guard cannot be held across <code>.await</code> in a multi-threaded runtime (it is <code>!Send</code>). Capture a snapshot with <code>context::capture()</code> and wrap the future with <code>snapshot.wrap(..)</code>. On executors that do not require <code>Send</code> (<code>join!</code>, <code>LocalSet</code>) the compiler cannot help: wrap every future that holds a guard across <code>.await</code>, or its fields show up in sibling futures.</p>
 </details>
 
 <details>

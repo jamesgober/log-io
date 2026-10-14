@@ -380,3 +380,116 @@ fn log_025_macros_evaluate_fields_only_when_enabled() {
     log_io::warn!(logger, "kept {}", probe(), v = probe());
     assert_eq!(evaluated.load(Ordering::Relaxed), 2);
 }
+
+// Re-audit of 2.0.0 (2026-10-14). Each of these failed on 2.0.0 as of
+// commit 0139f53.
+
+#[test]
+fn log_r06_call_site_duplicate_keys_are_written_once() {
+    let buf = Capture::default();
+    let logger = Logger::builder()
+        .no_timestamps()
+        .no_context()
+        .writer(buf.clone(), JsonFormat::new())
+        .build();
+    // Last one wins, as in most JSON parsers.
+    log_io::info!(logger, "m", a = 1_u8, b = 2_u8, a = 3_u8);
+    // `level` is written as `fields.level`, so the two collide.
+    logger.log(
+        Level::Info,
+        "m",
+        &[Field::new("level", "x"), Field::new("fields.level", "y")],
+    );
+    let text = buf.text();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert_eq!(lines[0].matches("\"a\"").count(), 1, "{}", lines[0]);
+    let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(first["a"], 3, "{}", lines[0]);
+    assert_eq!(first["b"], 2, "{}", lines[0]);
+    assert_eq!(lines[1].matches("fields.level").count(), 1, "{}", lines[1]);
+    let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(second["fields.level"], "y", "{}", lines[1]);
+    assert_eq!(second["level"], "info", "{}", lines[1]);
+}
+
+#[test]
+fn log_r06_context_and_defaults_collide_with_prefixed_call_keys() {
+    context::clear();
+    let buf = Capture::default();
+    let logger = Logger::builder()
+        .no_timestamps()
+        .with_default_field("level", "default")
+        .writer(buf.clone(), LogfmtFormat::new())
+        .build();
+    let _ctx = context::with_field("fields.message", "ctx");
+    logger.log(
+        Level::Info,
+        "m",
+        &[
+            Field::new("message", "call"),
+            Field::new("fields.level", "call"),
+        ],
+    );
+    let text = buf.text();
+    assert_eq!(text.matches("fields.level=").count(), 1, "{text}");
+    assert_eq!(text.matches("fields.message=").count(), 1, "{text}");
+    assert!(text.contains("fields.level=call"), "{text}");
+    assert!(text.contains("fields.message=call"), "{text}");
+    context::clear();
+}
+
+#[test]
+fn log_r08_comma_only_directive_is_an_error_not_off() {
+    for directive in [",", " , ,", ",,,"] {
+        let err = Filter::parse(directive).unwrap_err();
+        assert_eq!(err.kind(), ParseFilterErrorKind::Empty, "{directive:?}");
+    }
+    let buf = Capture::default();
+    let built = Logger::builder()
+        .level(Level::Info)
+        .filter_directive(",")
+        .no_timestamps()
+        .writer(buf.clone(), LogfmtFormat::new());
+    // `try_build` reports it; `build` keeps the previous filter.
+    let logger = built.build();
+    logger.log(Level::Info, "still logged", &[]);
+    assert!(buf.text().contains("still logged"), "{}", buf.text());
+    let err = Logger::builder()
+        .filter_directive(",")
+        .with_sink(log_io::sink::NullSink::new())
+        .try_build()
+        .unwrap_err();
+    assert!(matches!(err, log_io::BuildError::InvalidFilter(_)));
+}
+
+#[test]
+fn log_r05_common_secrets_cover_header_style_keys() {
+    let buf = Capture::default();
+    let logger = Logger::builder()
+        .no_timestamps()
+        .no_context()
+        .redact_common_secrets()
+        .writer(buf.clone(), JsonFormat::new())
+        .build();
+    let fields = [
+        Field::new("x-api-key", "s1"),
+        Field::new("Api-Key", "s2"),
+        Field::new("set-cookie", "s3"),
+        Field::new("Proxy-Authorization", "s4"),
+        Field::new("auth_token", "s5"),
+        Field::new("http.request.header.x-api-key", "s6"),
+        Field::new("privateKey", "s7"),
+        Field::new("session_token", "s8"),
+        Field::new("user", "visible"),
+    ];
+    logger.log(Level::Info, "request", &fields);
+    let text = buf.text();
+    for secret in ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"] {
+        assert!(
+            !text.contains(&format!("\"{secret}\"")),
+            "{secret} leaked: {text}"
+        );
+    }
+    assert!(text.contains("\"visible\""), "{text}");
+}

@@ -17,7 +17,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .open()?;
     let sink = NonBlocking::builder(file, JsonFormat::new())
         .capacity(4096)
-        .overflow(Overflow::Block) // never drop; DropNewest never waits
+        // Block never drops a record; DropNewest never waits on the
+        // writer (error records then only queue their flush).
+        .overflow(Overflow::Block)
         .build()?;
 
     let logger = Logger::builder().level(Level::Info).with_sink(sink).build();

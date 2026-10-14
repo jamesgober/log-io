@@ -13,7 +13,7 @@ use crate::context;
 use crate::error::{Error, Result};
 use crate::filter::Filter;
 use crate::level::Level;
-use crate::record::{Field, Metadata, Record};
+use crate::record::{Field, Metadata, Record, same_output_key};
 use crate::sink::{Sink, trim_buffer};
 use crate::time;
 use crate::value::{OwnedField, Value};
@@ -58,8 +58,14 @@ pub const REDACTED: &str = "[REDACTED]";
 /// 2. collects ambient fields: default fields, then the thread's
 ///    context ([`crate::context`]), then any extra context supplied by
 ///    an integration (for example `tracing` span fields);
-/// 3. removes duplicate keys so every key appears once. Precedence is
-///    call-site fields > extra context > thread context > defaults;
+/// 3. removes duplicate keys so every key appears once in the output.
+///    Precedence is call-site fields > extra context > thread context >
+///    defaults, and within call-site fields the last one wins (as in
+///    most JSON parsers). Keys count as duplicates when the JSON and
+///    logfmt formats would write them identically, so a `level` field
+///    (written as `fields.level`) and a `fields.level` field collide.
+///    Records written straight to a [`crate::format::Format`] without a
+///    logger are not de-duplicated;
 /// 4. replaces the values of redacted keys with [`REDACTED`];
 /// 5. hands the record to every sink in installation order. A failing
 ///    sink does not stop the others; each failure goes to the error
@@ -401,6 +407,15 @@ impl Logger {
         ctx: &[Field<'_>],
         extra: &[Field<'_>],
     ) -> Result<()> {
+        // Call-site keys are unique in the output too: the last one wins,
+        // keeping its position. Copied only when a duplicate exists.
+        let unique;
+        let fields = if has_duplicate_keys(fields) {
+            unique = last_occurrences(fields);
+            unique.as_slice()
+        } else {
+            fields
+        };
         let redacting = !self.inner.redact.is_empty();
         if self.inner.defaults.is_empty()
             && extra.is_empty()
@@ -418,7 +433,7 @@ impl Logger {
             let mut buf = [EMPTY_FIELD; INLINE_FIELDS];
             let mut len = 0;
             for owned in defaults {
-                if !fields.iter().any(|f| f.key == &*owned.key) {
+                if !fields.iter().any(|f| same_output_key(f.key, &owned.key)) {
                     buf[len] = owned.as_field();
                     len += 1;
                 }
@@ -474,8 +489,11 @@ impl Logger {
 
     #[inline]
     fn push_ambient<'a>(&self, ambient: &mut FieldBuf<'a>, field: Field<'a>, call: &[Field<'_>]) {
-        let shadowed = call.iter().any(|c| c.key == field.key)
-            || ambient.as_slice().iter().any(|a| a.key == field.key);
+        let shadowed = call.iter().any(|c| same_output_key(c.key, field.key))
+            || ambient
+                .as_slice()
+                .iter()
+                .any(|a| same_output_key(a.key, field.key));
         if !shadowed {
             ambient.push(self.redacted(field));
         }
@@ -494,7 +512,7 @@ impl Logger {
     }
 
     /// A key is redacted when it, or its last dot-separated segment,
-    /// equals a configured key (ASCII case-insensitive).
+    /// matches a configured key (ASCII case-insensitive, `-` == `_`).
     fn is_redacted(&self, key: &str) -> bool {
         if self.inner.redact.is_empty() {
             return false;
@@ -503,7 +521,7 @@ impl Logger {
         self.inner
             .redact
             .iter()
-            .any(|r| r.eq_ignore_ascii_case(key) || r.eq_ignore_ascii_case(last))
+            .any(|r| redact_key_matches(r, key) || redact_key_matches(r, last))
     }
 
     fn dispatch(&self, record: &Record<'_>) -> Result<()> {
@@ -531,8 +549,93 @@ impl Logger {
     }
 }
 
+/// Canonical form of a redaction key: ASCII lower case, `-` as `_`.
+pub(crate) fn normalize_redact_key(key: &str) -> String {
+    key.chars()
+        .map(|c| match c {
+            '-' => '_',
+            c => c.to_ascii_lowercase(),
+        })
+        .collect()
+}
+
+/// `true` if `key` matches the normalized redaction key `normalized`.
+/// Allocation-free; compares byte by byte.
+#[inline]
+fn redact_key_matches(normalized: &str, key: &str) -> bool {
+    normalized.len() == key.len()
+        && normalized.bytes().zip(key.bytes()).all(|(r, k)| {
+            let k = if k == b'-' {
+                b'_'
+            } else {
+                k.to_ascii_lowercase()
+            };
+            r == k
+        })
+}
+
 fn any_key_in(a: &[Field<'_>], b: &[Field<'_>]) -> bool {
-    !b.is_empty() && a.iter().any(|x| b.iter().any(|y| x.key == y.key))
+    !b.is_empty()
+        && a.iter()
+            .any(|x| b.iter().any(|y| same_output_key(x.key, y.key)))
+}
+
+/// `true` if two call-site fields would be written under one key.
+///
+/// Runs on every record with two or more fields, so it avoids the
+/// pairwise comparison of every key: one pass sets a bit per key class
+/// (see [`key_class`]), and only a key whose class is already taken is
+/// compared, with the earlier keys of that class.
+#[inline]
+fn has_duplicate_keys(fields: &[Field<'_>]) -> bool {
+    if fields.len() < 2 {
+        return false;
+    }
+    let mut seen = 0_u64;
+    for (i, field) in fields.iter().enumerate() {
+        let class = key_class(field.key);
+        let bit = 1_u64 << class;
+        if seen & bit != 0
+            && fields[..i].iter().any(|earlier| {
+                key_class(earlier.key) == class && same_output_key(earlier.key, field.key)
+            })
+        {
+            return true;
+        }
+        seen |= bit;
+    }
+    false
+}
+
+/// A 6-bit class that is equal for keys the formats write identically:
+/// a hash of the last two bytes, which a key shares with its
+/// `fields.`-prefixed alias.
+#[inline]
+fn key_class(key: &str) -> u32 {
+    let tail = match key.as_bytes() {
+        [.., a, b] => u16::from_le_bytes([*a, *b]),
+        [b] => u16::from(*b),
+        [] => 0,
+    };
+    let hash = u64::from(tail).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58;
+    #[allow(clippy::cast_possible_truncation)] // `hash < 64`
+    let class = hash as u32;
+    class
+}
+
+/// `fields` without the earlier occurrences of duplicated keys.
+#[cold]
+fn last_occurrences<'a>(fields: &[Field<'a>]) -> FieldBuf<'a> {
+    let mut unique = FieldBuf::new();
+    for (i, f) in fields.iter().enumerate() {
+        if !fields[i + 1..]
+            .iter()
+            .any(|later| same_output_key(later.key, f.key))
+        {
+            unique.push(*f);
+        }
+    }
+    unique
 }
 
 impl fmt::Debug for Logger {

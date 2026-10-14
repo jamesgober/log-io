@@ -15,6 +15,7 @@ path = "src/lib.rs"
 arbitrary = { version = "1", features = ["derive"] }
 libfuzzer-sys = "0.4"
 log-io = { path = ".." }
+serde = "1"
 serde_json = { version = "1", features = ["float_roundtrip"] }
 
 [[bin]]

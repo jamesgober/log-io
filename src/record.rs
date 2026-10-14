@@ -8,6 +8,52 @@
 use crate::level::Level;
 use crate::value::Value;
 
+/// Keys that every built-in structured format writes itself. A user
+/// field with one of these names would shadow (or, in last-wins JSON
+/// parsers, override) the real value, so the JSON and logfmt formats
+/// write it with [`RESERVED_PREFIX`] instead.
+#[cfg(any(feature = "std", feature = "json", feature = "logfmt"))]
+#[inline]
+pub(crate) fn is_reserved_key(key: &str) -> bool {
+    matches!(
+        key,
+        "timestamp" | "level" | "target" | "message" | "file" | "line"
+    )
+}
+
+/// Prefix applied to user keys that collide with a reserved key.
+#[cfg(any(feature = "std", feature = "json", feature = "logfmt"))]
+pub(crate) const RESERVED_PREFIX: &str = "fields.";
+
+/// `true` if the structured formats write `a` and `b` under the same
+/// key: the keys are equal, or one is a reserved key and the other is
+/// that key with [`RESERVED_PREFIX`] (`level` is written as
+/// `fields.level`).
+///
+/// Runs for every pair of call-site fields on every record, so it
+/// rejects on length and on the first and last bytes before comparing
+/// whole keys: distinct keys almost never pay for a full comparison.
+#[cfg(feature = "std")]
+#[inline]
+pub(crate) fn same_output_key(a: &str, b: &str) -> bool {
+    let (x, y) = (a.as_bytes(), b.as_bytes());
+    if x.len() == y.len() {
+        x.first() == y.first() && x.last() == y.last() && x == y
+    } else if x.len().abs_diff(y.len()) == RESERVED_PREFIX.len() {
+        is_prefixed_alias(a, b) || is_prefixed_alias(b, a)
+    } else {
+        false
+    }
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn is_prefixed_alias(plain: &str, prefixed: &str) -> bool {
+    prefixed.len() == plain.len() + RESERVED_PREFIX.len()
+        && prefixed.strip_prefix(RESERVED_PREFIX) == Some(plain)
+        && is_reserved_key(plain)
+}
+
 /// A single key-value pair attached to a [`Record`].
 ///
 /// Keys are borrowed strings. Values are borrowed via [`Value`]. Keys

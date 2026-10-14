@@ -183,7 +183,8 @@ impl Filter {
     /// # Errors
     ///
     /// Returns [`ParseFilterError`] identifying the offending segment
-    /// when the input is empty or blank, a level is unknown, a target is
+    /// when the input has no segment (empty, blank, or only commas such
+    /// as `","`), a level is unknown, a target is
     /// empty (`=debug`), a target contains whitespace, or a target ends
     /// with a separator (`app::=debug`, `app.=debug`).
     ///
@@ -201,18 +202,14 @@ impl Filter {
     /// # Ok::<(), log_io::ParseFilterError>(())
     /// ```
     pub fn parse(directive: &str) -> Result<Self, ParseFilterError> {
-        if directive.trim().is_empty() {
-            return Err(ParseFilterError::new(
-                ParseFilterErrorKind::Empty,
-                directive,
-            ));
-        }
         let mut filter = Self::new(Level::Off);
+        let mut segments = 0_usize;
         for raw in directive.split(',') {
             let segment = raw.trim();
             if segment.is_empty() {
                 continue;
             }
+            segments += 1;
             match segment.split_once('=') {
                 Some((target, level)) => {
                     let target = target.trim();
@@ -229,6 +226,14 @@ impl Filter {
                     filter.default_level = level;
                 }
             }
+        }
+        if segments == 0 {
+            // `""`, `"  "`, `","`: nothing was asked for. Treating it as
+            // "default Off, no rules" would silence all logging.
+            return Err(ParseFilterError::new(
+                ParseFilterErrorKind::Empty,
+                directive,
+            ));
         }
         filter.recompute_min();
         Ok(filter)

@@ -198,21 +198,7 @@ pub(crate) fn value_needs_quotes(s: &str) -> bool {
 }
 
 #[cfg(any(feature = "json", feature = "logfmt"))]
-/// Keys that every built-in structured format writes itself. A user
-/// field with one of these names would shadow (or, in last-wins JSON
-/// parsers, override) the real value, so it is written with
-/// [`RESERVED_PREFIX`] instead.
-#[inline]
-pub(crate) fn is_reserved_key(key: &str) -> bool {
-    matches!(
-        key,
-        "timestamp" | "level" | "target" | "message" | "file" | "line"
-    )
-}
-
-#[cfg(any(feature = "json", feature = "logfmt"))]
-/// Prefix applied to user keys that collide with a reserved key.
-pub(crate) const RESERVED_PREFIX: &str = "fields.";
+pub(crate) use crate::record::{RESERVED_PREFIX, is_reserved_key};
 
 #[cfg(any(feature = "logfmt", feature = "human"))]
 /// Write a key for logfmt or the human format. Characters that would

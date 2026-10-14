@@ -32,16 +32,20 @@ background and rotating sinks). Upgrade guide:
 - Macro messages are format strings: literal braces must be escaped.
   The logger argument must dereference to `&Logger`.
 - Filters pick the most specific matching rule instead of the first one;
-  `Filter::parse` rejects empty input, empty targets, targets ending in a
+  `Filter::parse` rejects empty input (including a directive with only
+  empty segments, such as `","`), empty targets, targets ending in a
   separator, and targets containing whitespace; `ParseFilterError` is a
   struct with `kind()` and `segment()`. Records at `Level::Off` are never
   admitted.
 - Records at `Level::Error` and above are flushed before the logging call
   returns (`LoggerBuilder::flush_on(Level::Off)` restores 1.x behaviour).
+  A `NonBlocking` sink with `Overflow::DropNewest` is the exception: it
+  never waits, and only queues the flush for its worker.
   Dropping the last `Logger` clone shuts its sinks down.
 - `on_error` is called once per failing sink and for flush errors.
 - Output changes: reserved keys are written as `fields.<key>`, duplicate
-  keys are removed, floats use the round-trippable `{:?}` form, logfmt
+  keys are removed (including repeated call-site keys, where the last one
+  wins, and `level` / `fields.level` pairs), floats use the round-trippable `{:?}` form, logfmt
   escapes are JSON-compatible, more characters are escaped in every
   format, `stdout_human` / `stderr_human` colour on terminals. Full table
   in the migration guide.
@@ -68,12 +72,16 @@ background and rotating sinks). Upgrade guide:
   for futures) to carry context across threads and async tasks.
 - `sink::NonBlocking`: background writer with a bounded queue, an
   `Overflow` policy (`Block` or `DropNewest`), drop and error counters,
-  and synchronous fallback after shutdown.
+  and synchronous fallback after shutdown. Its writer and `on_error`
+  handler may log into the same sink without deadlocking.
 - `sink::RotatingFile` (size and UTC time rotation, retention, safe on
-  Windows) and the `RotatingFileSink` alias.
+  Windows, all-or-nothing rotation that never loses rotated history)
+  and the `RotatingFileSink` alias.
 - `FileSink::builder` with `buffer_capacity` and `sync_on_flush`;
   `WriterSink::{with_writer, into_inner}`.
-- `Sink::shutdown` (provided, defaults to `flush`).
+- `Sink::shutdown` (provided, defaults to `flush`) and
+  `Sink::request_flush` (provided, defaults to `flush`; called for
+  records at the flush level, so a background sink can avoid waiting).
 - `format::from_fn` closure adapter; `HumanFormat::color` and
   `format::ColorChoice` (TTY detection, `NO_COLOR`, `CLICOLOR_FORCE`);
   `LogfmtFormat::timestamp_rfc3339`.
@@ -110,6 +118,41 @@ background and rotating sinks). Upgrade guide:
   (re-measured), the rotation advice, and broken links.
 
 ### Fixed
+
+Found by the 2026-10-14 re-audit of this release before publication:
+
+- A `RotatingFile` rotation whose final rename failed (on Windows,
+  another process holding the active file without delete sharing) had
+  already deleted the oldest rotated file and shifted the rest, so every
+  retry deleted one more file of history. Rotation now moves the active
+  file aside first, prunes only after every rename succeeded, and undoes
+  completed renames on failure (LOG-R01).
+- With `global::install_panic_hook`, a panic on a `NonBlocking` worker
+  thread hung the process forever and swallowed the panic message: the
+  hook logged into the same sink and waited for the panicking thread.
+  The hook now skips the logger on background worker threads, and a
+  `NonBlocking` sink never waits for itself (LOG-R02).
+- Under `Overflow::DropNewest`, one `error!` waited for the whole
+  `NonBlocking` queue to be written (357 ms measured), contradicting
+  "never waits". Flush-level records now only queue a flush request
+  there (LOG-R03).
+- A `ContextGuard` held across an `.await` inside a future wrapped with
+  `ContextSnapshot::wrap` leaked into sibling futures polled on the same
+  thread (`join!`, `LocalSet`); the wrapper now keeps such context with
+  its future between polls (LOG-R04).
+- `redact_common_secrets` missed hyphenated header names (`x-api-key`,
+  `set-cookie`, `proxy-authorization`) and some common keys; matching
+  now treats `-` and `_` alike and the list grew (LOG-R05).
+- Repeated call-site keys (`info!(lg, "m", a = 1, a = 2)`) were written
+  twice (LOG-R06).
+- `NonBlockingBuilder::build` panicked for a thread name containing NUL
+  and for huge capacities instead of returning an error (LOG-R07).
+- The directive `","` parsed to an all-`Off` filter, silencing all
+  logging (LOG-R08).
+- `RotatingFile` read the clock on every write even without a time
+  schedule (LOG-R09).
+
+From the 2026-10-13 audit of 1.0.0:
 
 - Buffered `FileSink` records were lost when the logger lived in a
   `static` or the process exited without dropping it (LOG-001).

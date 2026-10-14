@@ -5,6 +5,10 @@ edition = "2024"
 rust-version = "1.85"
 readme = "README.md"
 license = "Apache-2.0"
+# Repository tooling that means nothing to a dependent crate: the CI
+# workflow and the toolchain pin (which would otherwise apply to anyone
+# building from the unpacked package).
+exclude = [".github/", "rust-toolchain.toml", ".editorconfig"]
 
 authors = [
     "James Gober <me@jamesgober.com>"

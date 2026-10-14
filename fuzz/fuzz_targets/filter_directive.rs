@@ -6,7 +6,9 @@
 //! * a parsed filter is internally consistent: `is_enabled` agrees with
 //!   `threshold_for`, nothing below `min_level` is admitted, and rules
 //!   are ordered most specific first;
-//! * an error always names a segment of the input.
+//! * an error always names a segment of the input;
+//! * a directive without a non-blank segment (`""`, `","`) is an error,
+//!   never a filter that silently turns logging off.
 
 use libfuzzer_sys::fuzz_target;
 use log_io::{Filter, Level};
@@ -15,6 +17,7 @@ fuzz_target!(|data: (&str, &str)| {
     let (directive, target) = data;
     match Filter::parse(directive) {
         Ok(filter) => {
+            assert!(directive.split(',').any(|s| !s.trim().is_empty()));
             let threshold = filter.threshold_for(target);
             for level in Level::ALL {
                 assert_eq!(filter.is_enabled(target, level), level >= threshold);

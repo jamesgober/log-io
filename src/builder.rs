@@ -7,6 +7,7 @@ use crate::filter::{Filter, ParseFilterError};
 use crate::format::Format;
 use crate::level::Level;
 use crate::logger::{ErrorHandler, Logger, LoggerInner};
+use crate::record::same_output_key;
 use crate::sink::{Sink, StderrSink, StdoutSink, WriterSink};
 use crate::value::{OwnedField, Value};
 
@@ -90,21 +91,34 @@ pub struct LoggerBuilder {
 
 impl LoggerBuilder {
     /// Keys redacted by [`LoggerBuilder::redact_common_secrets`].
+    ///
+    /// Matching treats `-` and `_` alike, so `api_key` also covers the
+    /// HTTP header names `api-key` and `x-api-key` (via `x_api_key`),
+    /// and `set_cookie` covers `set-cookie`. Matching is otherwise
+    /// exact: `user_password` is not covered by `password`; add such
+    /// keys with [`LoggerBuilder::redact_key`].
     pub const COMMON_SECRET_KEYS: &'static [&'static str] = &[
         "password",
         "passwd",
         "secret",
+        "secret_key",
         "client_secret",
         "token",
         "access_token",
         "refresh_token",
         "id_token",
+        "auth_token",
+        "session_token",
+        "jwt",
         "api_key",
         "apikey",
+        "x_api_key",
         "authorization",
+        "proxy_authorization",
         "cookie",
         "set_cookie",
         "private_key",
+        "privatekey",
         "credentials",
     ];
 
@@ -143,8 +157,9 @@ impl LoggerBuilder {
 
     /// Parse `directive` (see [`Filter::parse`]) and replace the filter.
     ///
-    /// A blank directive changes nothing. An invalid directive keeps
-    /// the previous filter and is reported by [`Self::try_build`] as
+    /// A blank directive (empty or whitespace only) changes nothing. An
+    /// invalid directive, including one with only empty segments such
+    /// as `","`, keeps the previous filter and is reported by [`Self::try_build`] as
     /// [`BuildError::InvalidFilter`]; [`Self::build`] ignores it. Use
     /// [`Self::try_filter_directive`] to handle the error immediately.
     pub fn filter_directive(mut self, directive: &str) -> Self {
@@ -174,8 +189,11 @@ impl LoggerBuilder {
     /// example `.env_filter("LOG_IO")` or `.env_filter("RUST_LOG")`.
     ///
     /// If the variable is unset, empty, or blank, the filter configured
-    /// so far is kept, so call [`Self::level`] first to set the
-    /// fallback. An invalid value (including one that is not valid
+    /// so far (for example by an earlier [`Self::level`]) is kept. A set
+    /// value replaces the whole filter, default level included, as
+    /// `RUST_LOG` does: `LOG_IO=app::db=debug` logs only `app::db`, so
+    /// write `LOG_IO=info,app::db=debug` to keep `info` elsewhere. An
+    /// invalid value (including `","` and a value that is not valid
     /// Unicode) keeps the previous filter and is reported by
     /// [`Self::try_build`].
     pub fn env_filter(self, var: &str) -> Self {
@@ -227,7 +245,11 @@ impl LoggerBuilder {
     ) -> Self {
         let key = key.into();
         let field = OwnedField::new(&key, value.into());
-        if let Some(existing) = self.defaults.iter_mut().find(|f| *f.key == *key) {
+        if let Some(existing) = self
+            .defaults
+            .iter_mut()
+            .find(|f| same_output_key(&f.key, &key))
+        {
             *existing = field;
         } else {
             self.defaults.push(field);
@@ -253,13 +275,16 @@ impl LoggerBuilder {
         self
     }
 
-    /// Replace the value of every field named `key` (ASCII
-    /// case-insensitive, also matching the last dot-separated segment,
-    /// so `password` covers `db.password`) with `"[REDACTED]"`. Applies
-    /// to call-site fields, context, and default fields. The message
-    /// text is never inspected.
+    /// Replace the value of every field named `key` with
+    /// `"[REDACTED]"`. Applies to call-site fields, context, and default
+    /// fields. The message text is never inspected.
+    ///
+    /// Matching is ASCII case-insensitive, treats `-` and `_` as the
+    /// same character (so `api_key` covers the header name `Api-Key`),
+    /// and also tests the last dot-separated segment of a key (so
+    /// `password` covers `db.password`).
     pub fn redact_key(mut self, key: impl Into<String>) -> Self {
-        let key = key.into().to_ascii_lowercase().into_boxed_str();
+        let key = crate::logger::normalize_redact_key(&key.into()).into_boxed_str();
         if !self.redact.contains(&key) {
             self.redact.push(key);
         }
