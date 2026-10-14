@@ -1,6 +1,6 @@
 [package]
 name = "log-io"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2024"
 rust-version = "1.85"
 readme = "README.md"
@@ -10,7 +10,7 @@ authors = [
     "James Gober <me@jamesgober.com>"
 ]
 
-description = "Structured logging pipeline for Rust. Zero-allocation fast path, JSON / logfmt / human-readable outputs, context propagation (request-id, trace-id), per-module filtering, async-safe sinks. An IO pipeline for log records, not a wrapper around log+tracing."
+description = "Structured logging pipeline for Rust: filter, format, sink. Allocation-free hot path, JSON / logfmt / human output that is safe for any input, thread and async context propagation, per-target filtering, durable shutdown, background and rotating file sinks, plus optional log and tracing bridges."
 
 keywords = [
     "logging",
@@ -22,7 +22,6 @@ keywords = [
 
 categories = [
     "development-tools::debugging",
-    "asynchronous",
     "no-std"
 ]
 

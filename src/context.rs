@@ -721,12 +721,7 @@ mod tests {
 
     #[test]
     fn test_with_context_future_installs_snapshot_per_poll() {
-        use std::task::{Wake, Waker};
-
-        struct Noop;
-        impl Wake for Noop {
-            fn wake(self: Arc<Self>) {}
-        }
+        use std::task::Waker;
 
         /// Yields once, then reports the context length.
         struct YieldThenLen(bool);
@@ -747,13 +742,13 @@ mod tests {
         let snapshot = ContextSnapshot::from_fields(&[Field::new("req", "r1")]);
         let mut fut = snapshot.wrap(YieldThenLen(false));
         assert!(format!("{fut:?}").starts_with("WithContext"));
-        let waker = Waker::from(Arc::new(Noop));
+        let waker = Waker::noop().clone();
         let mut cx = TaskContext::from_waker(&waker);
         assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
         assert_eq!(len(), 0, "nothing leaks between polls");
         // Resume on a different thread, as a work-stealing executor might.
         let out = std::thread::spawn(move || {
-            let waker = Waker::from(Arc::new(Noop));
+            let waker = Waker::noop().clone();
             let mut cx = TaskContext::from_waker(&waker);
             Pin::new(&mut fut).poll(&mut cx)
         })

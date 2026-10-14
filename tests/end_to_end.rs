@@ -498,12 +498,7 @@ fn non_blocking_sink_through_a_logger_flushes_on_error() {
 fn context_snapshot_follows_a_future_across_threads() {
     use std::future::Future;
     use std::pin::Pin;
-    use std::task::{Context, Poll, Wake, Waker};
-
-    struct Noop;
-    impl Wake for Noop {
-        fn wake(self: Arc<Self>) {}
-    }
+    use std::task::{Context, Poll, Waker};
 
     /// Logs once per poll and yields twice before completing.
     struct Steps<'a> {
@@ -546,7 +541,7 @@ fn context_snapshot_follows_a_future_across_threads() {
     for _ in 0..3 {
         std::thread::scope(|s| {
             s.spawn(|| {
-                let waker = Waker::from(Arc::new(Noop));
+                let waker = Waker::noop().clone();
                 let mut cx = Context::from_waker(&waker);
                 let _ = Pin::new(&mut task).poll(&mut cx);
                 assert_eq!(context::len(), 0, "nothing left behind on the worker");
