@@ -163,6 +163,7 @@ impl<S: Sink + ?Sized> Sink for Box<S> {
 
 mod file;
 mod non_blocking;
+mod recent;
 mod rotating;
 mod stdio;
 mod writer;
@@ -170,6 +171,7 @@ mod writer;
 pub use self::file::{FileSink, FileSinkBuilder};
 pub(crate) use self::non_blocking::on_background_worker;
 pub use self::non_blocking::{NonBlocking, NonBlockingBuilder, Overflow};
+pub use self::recent::{DEFAULT_LINE_LIMIT, RecentLines};
 pub use self::rotating::{RotatingFile, RotatingFileBuilder, Rotation};
 pub use self::stdio::{StderrSink, StdoutSink};
 pub use self::writer::{NullSink, WriterSink};
@@ -262,6 +264,19 @@ where
         .and_then(|()| write(buf).map_err(Error::Io));
     trim_buffer(buf);
     result
+}
+
+/// Applies a Unix permission mode to files `options` creates. On other
+/// platforms the file inherits its directory's access control list and
+/// `mode` has no effect.
+pub(crate) fn apply_mode(options: &mut std::fs::OpenOptions, mode: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _options = options.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _unused = (options, mode);
 }
 
 /// Acquire a mutex guard even if the mutex is poisoned.

@@ -113,6 +113,8 @@ pub struct RotatingFile {
     rotation: Rotation,
     max_files: usize,
     buffer_capacity: usize,
+    /// Unix permission bits for files this writer creates.
+    mode: Option<u32>,
     /// Index of the UTC period the active file belongs to.
     period: Option<u64>,
     /// A rotation failure waiting to be reported by `flush`.
@@ -130,6 +132,7 @@ impl RotatingFile {
             rotation: Rotation::Never,
             max_files: 5,
             buffer_capacity: 8 * 1024,
+            mode: None,
         }
     }
 
@@ -196,7 +199,7 @@ impl RotatingFile {
             drop(writer);
         }
         let rotated = self.move_active_into_history();
-        let reopened = open_append(&self.path, self.buffer_capacity);
+        let reopened = open_append(&self.path, self.buffer_capacity, self.mode);
         match reopened {
             Ok((writer, size)) => {
                 self.file = Some(writer);
@@ -343,7 +346,7 @@ impl Write for RotatingFile {
         let writer = match self.file.as_mut() {
             Some(w) => w,
             None => {
-                let (writer, size) = open_append(&self.path, self.buffer_capacity)?;
+                let (writer, size) = open_append(&self.path, self.buffer_capacity, self.mode)?;
                 self.size = size;
                 self.file.insert(writer)
             }
@@ -395,6 +398,7 @@ pub struct RotatingFileBuilder {
     rotation: Rotation,
     max_files: usize,
     buffer_capacity: usize,
+    mode: Option<u32>,
 }
 
 impl RotatingFileBuilder {
@@ -423,6 +427,29 @@ impl RotatingFileBuilder {
         self
     }
 
+    /// Unix permission bits for every file this writer creates: the active
+    /// file and each new one after a rotation, such as `0o600` or `0o640`.
+    /// The process umask still applies, and an existing file keeps its
+    /// mode. Without this call files get `0o666` minus the umask, as
+    /// before 2.1. On Windows files inherit their directory's access
+    /// control list and the mode has no effect.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use log_io::sink::{RotatingFile, Rotation};
+    ///
+    /// let file = RotatingFile::builder("app.log")
+    ///     .rotation(Rotation::Daily)
+    ///     .mode(0o640)
+    ///     .open()?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub const fn mode(mut self, mode: u32) -> Self {
+        self.mode = Some(mode);
+        self
+    }
+
     /// Open (or create) the active file in append mode.
     ///
     /// If the file already exists and was last modified in an earlier
@@ -436,7 +463,7 @@ impl RotatingFileBuilder {
     }
 
     fn open_with_clock(self, now: fn() -> SystemTime) -> io::Result<RotatingFile> {
-        let (writer, size) = open_append(&self.path, self.buffer_capacity)?;
+        let (writer, size) = open_append(&self.path, self.buffer_capacity, self.mode)?;
         let period = self.rotation.period_secs().map(|p| {
             let started = if size > 0 {
                 writer
@@ -457,6 +484,7 @@ impl RotatingFileBuilder {
             rotation: self.rotation,
             max_files: self.max_files,
             buffer_capacity: self.buffer_capacity,
+            mode: self.mode,
             period,
             deferred_error: None,
             now,
@@ -464,8 +492,15 @@ impl RotatingFileBuilder {
     }
 }
 
-fn open_append(path: &Path, capacity: usize) -> io::Result<(BufWriter<File>, u64)> {
-    let file = OpenOptions::new().create(true).append(true).open(path)?;
+fn open_append(
+    path: &Path,
+    capacity: usize,
+    mode: Option<u32>,
+) -> io::Result<(BufWriter<File>, u64)> {
+    let mut options = OpenOptions::new();
+    let _options = options.create(true).append(true);
+    super::apply_mode(&mut options, mode);
+    let file = options.open(path)?;
     let size = file.metadata()?.len();
     Ok((BufWriter::with_capacity(capacity, file), size))
 }
@@ -921,5 +956,26 @@ mod tests {
 "
         );
         assert!(!dir.file("held.log.4").exists(), "max_files still applies");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_rotating_mode_applies_to_active_and_rotated_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("mode");
+        let mut w = RotatingFile::builder(dir.file("app.log"))
+            .max_bytes(5)
+            .max_files(2)
+            .buffer_capacity(0)
+            .mode(0o600)
+            .open()
+            .unwrap();
+        w.write_all(b"11111").unwrap();
+        w.write_all(b"22222").unwrap(); // rotates: a new active file is created
+        w.flush().unwrap();
+        for name in ["app.log", "app.log.1"] {
+            let mode = fs::metadata(dir.file(name)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{name}");
+        }
     }
 }

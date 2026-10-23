@@ -6,6 +6,27 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-10-23
+
+Additive release: nothing that worked with 2.0 changes behaviour.
+
+### Added
+
+- `sink::RecentLines<F>`: a ring of the last N formatted lines for crash
+  reports and status pages. Slots are allocated up front (`capacity`
+  lines of at most `line_limit` bytes, `DEFAULT_LINE_LIMIT` = 1 KiB), so
+  memory is fixed and writing does not allocate; longer lines are cut on
+  a character boundary. `snapshot` and `write_to` read it oldest first;
+  `try_snapshot` and `try_write_to` never block, so a panic hook can read
+  the ring even if the panic happened while it was being written.
+  Redacted values stay redacted.
+- `FileSinkBuilder::mode(bits)` and `RotatingFileBuilder::mode(bits)`:
+  Unix permission bits for every file the sink creates (for a rotating
+  file, also each new file after a rotation). The umask still applies and
+  existing files keep their mode. Without the call nothing changes. No
+  effect on Windows, where files inherit the directory's access control
+  list.
+
 ## [2.0.0] - 2026-10-13
 
 Major release. Fixes every finding of the 2026-10-13 audit, several of
@@ -311,7 +332,8 @@ Initial repository scaffold: Apache-2.0 license, README, REPS
 specification stub and CI workflow. This version was not published to
 crates.io.
 
-[Unreleased]: https://github.com/jamesgober/log-io/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/log-io/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/jamesgober/log-io/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/jamesgober/log-io/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/jamesgober/log-io/compare/v0.10.0...v1.0.0
 [0.10.0]: https://github.com/jamesgober/log-io/releases/tag/v0.10.0

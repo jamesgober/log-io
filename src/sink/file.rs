@@ -5,7 +5,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
-use super::{CachePadded, Sink, lock_recover, write_locked};
+use super::{CachePadded, Sink, apply_mode, lock_recover, write_locked};
 use crate::error::{Error, Result};
 use crate::format::Format;
 use crate::record::Record;
@@ -94,6 +94,7 @@ impl<F: Format> FileSink<F> {
             append: true,
             buffer_capacity: DEFAULT_BUFFER,
             sync_on_flush: false,
+            mode: None,
         }
     }
 }
@@ -131,6 +132,7 @@ pub struct FileSinkBuilder<F> {
     append: bool,
     buffer_capacity: usize,
     sync_on_flush: bool,
+    mode: Option<u32>,
 }
 
 impl<F: Format> FileSinkBuilder<F> {
@@ -158,18 +160,44 @@ impl<F: Format> FileSinkBuilder<F> {
         self
     }
 
+    /// Unix permission bits for the file when this call creates it, such
+    /// as `0o600` (owner only) or `0o640`. The process umask still applies,
+    /// and an existing file keeps its mode. Without this call the file
+    /// gets `0o666` minus the umask, as before 2.1. On Windows the file
+    /// inherits its directory's access control list and the mode has no
+    /// effect.
+    ///
+    /// # Examples
+    ///
+    #[cfg_attr(all(feature = "json"), doc = "```no_run")]
+    #[cfg_attr(not(all(feature = "json")), doc = "```ignore")]
+    /// use log_io::format::JsonFormat;
+    /// use log_io::sink::FileSink;
+    ///
+    /// let sink = FileSink::builder("app.jsonl", JsonFormat::new())
+    ///     .mode(0o600)
+    ///     .open()?;
+    /// # Ok::<(), log_io::Error>(())
+    /// ```
+    pub const fn mode(mut self, mode: u32) -> Self {
+        self.mode = Some(mode);
+        self
+    }
+
     /// Open the file and build the sink.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Io`] if the file cannot be opened or created.
     pub fn open(self) -> Result<FileSink<F>> {
-        let file = OpenOptions::new()
+        let mut options = OpenOptions::new();
+        let _options = options
             .create(true)
             .write(true)
             .append(self.append)
-            .truncate(!self.append)
-            .open(&self.path)?;
+            .truncate(!self.append);
+        apply_mode(&mut options, self.mode);
+        let file = options.open(&self.path)?;
         Ok(FileSink {
             format: self.format,
             target: CachePadded(Mutex::new(BufWriter::with_capacity(
@@ -259,5 +287,27 @@ mod tests {
         let path = dir.join("nested").join("file.log");
         let err = FileSink::append(&path, JsonFormat::new()).unwrap_err();
         assert!(matches!(err, Error::Io(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_file_sink_mode_applies_to_a_new_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_path("mode.jsonl");
+        let sink = FileSink::builder(&path, JsonFormat::new())
+            .mode(0o600)
+            .open()
+            .unwrap();
+        drop(sink);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_file_sink_without_mode_still_opens() {
+        let path = temp_path("no-mode.jsonl");
+        assert!(FileSink::builder(&path, JsonFormat::new()).open().is_ok());
+        let _ = std::fs::remove_file(&path);
     }
 }
