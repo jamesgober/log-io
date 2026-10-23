@@ -182,7 +182,7 @@ No heap allocation per record in steady state (enforced by
 
 ## Status: Stable
 
-**Current version:** `2.0.0`. The API follows Semantic Versioning;
+**Current version:** `2.1.0`. The API follows Semantic Versioning;
 `Value`, `Error`, `Metadata`, `Record` and the configuration enums are
 `#[non_exhaustive]` so they can grow in minor releases. Upgrading from
 1.x: see [`docs/MIGRATION.md`](docs/MIGRATION.md).

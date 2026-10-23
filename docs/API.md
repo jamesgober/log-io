@@ -518,10 +518,11 @@ drop. A sink must keep accepting records afterwards. `Arc<S>` and
 | Sink | Writes to | Notes |
 |---|---|---|
 | `StdoutSink<F>` / `StderrSink<F>` | standard streams | one `write_all` per record under the stream's own lock |
-| `FileSink<F>` | a file | 8 KiB buffer by default; `builder` sets `append`, `buffer_capacity`, `sync_on_flush` |
+| `FileSink<F>` | a file | 8 KiB buffer by default; `builder` sets `append`, `buffer_capacity`, `sync_on_flush`, and (since 2.1) `mode` |
 | `WriterSink<W, F>` | any `io::Write + Send` | `with_writer` gives locked access; `into_inner` returns the writer |
 | `RotatingFileSink<F>` | `WriterSink<RotatingFile, F>` | see below |
 | `NonBlocking<F>` | any `io::Write + Send`, on a thread | see below |
+| `RecentLines<F>` | memory: the last N formatted lines | fixed memory; `try_snapshot` and `try_write_to` never block (since 2.1); see below |
 | `NullSink` | nowhere | does not format |
 
 Built-in sinks recover from mutex poisoning and format outside their
@@ -563,6 +564,62 @@ rotations report `AlreadyExists` until that file is moved away.
 
 Behind a `NonBlocking` sink the file receives the worker's batches, so
 it can exceed `max_bytes` by up to the worker's `buffer_capacity`.
+
+### File permissions (since 2.1)
+
+`FileSink::builder(..).mode(bits)` and `RotatingFile::builder(..).mode(bits)`
+set the Unix permission bits of every file the sink creates (for a
+rotating file: the active file and each new one after a rotation), such
+as `0o600` (owner only) or `0o640`. The process umask still applies, and
+an existing file keeps its mode. Without `mode` a new file gets `0o666`
+minus the umask, as in 2.0. On Windows files inherit their directory's
+access control list and `mode` has no effect.
+
+```rust,no_run
+use log_io::sink::{RotatingFile, Rotation};
+
+let file = RotatingFile::builder("logs/app.jsonl")
+    .rotation(Rotation::Daily)
+    .mode(0o600)
+    .open()?;
+# let _ = file;
+# Ok::<(), std::io::Error>(())
+```
+
+### `RecentLines` (since 2.1)
+
+A ring of the last N formatted lines, held in memory for a crash report,
+a status page, or a support bundle. Every slot is allocated when the sink
+is built (`capacity` lines of at most `line_limit` bytes, 1 KiB by
+default), so memory is fixed and writing a record does not allocate. A
+longer line is cut at the last character boundary that fits. Lines are
+formatted from the record the logger built, so redacted values stay
+redacted.
+
+```rust
+use std::sync::Arc;
+use log_io::format::LogfmtFormat;
+use log_io::sink::RecentLines;
+use log_io::Logger;
+
+let recent = Arc::new(RecentLines::new(64, LogfmtFormat::new()));
+let logger = Logger::builder()
+    .stderr_logfmt()
+    .with_sink(Arc::clone(&recent))
+    .build();
+log_io::warn!(logger, "cache miss storm", misses = 912_u64);
+
+// Later, for example from a panic hook: never blocks.
+let mut report = String::new();
+if recent.try_write_to(&mut report) == Ok(true) {
+    assert!(report.contains("cache miss storm"));
+}
+```
+
+`snapshot` returns the lines oldest first; `write_to` writes them one per
+line. `try_snapshot` and `try_write_to` return without waiting when the
+ring is held, so a panic hook can read it even when the panic happened
+while this sink was writing.
 
 ### `NonBlocking`
 
