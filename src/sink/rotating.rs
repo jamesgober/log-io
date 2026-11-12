@@ -1031,7 +1031,7 @@ mod tests {
         w.rotate_now().unwrap();
         fs::remove_file(dir.file("app.log")).unwrap();
         std::os::unix::fs::symlink(&victim, dir.file("app.log")).unwrap();
-        w.rotate_now().ok();
+        let _ = w.rotate_now();
         let _ = w.write_all(b"appended-by-logger");
         let _ = w.flush();
         assert_eq!(fs::read_to_string(&victim).unwrap(), "important=1\n");
