@@ -6,6 +6,61 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-11-11
+
+Fixes from an independent review. No breaking API change; MSRV
+unchanged (1.85); no new dependency. Two defaults change for safety
+(file mode and symbolic links, below); each has a builder option that
+restores the earlier behaviour.
+
+### Added
+
+- `log_io::init_json()`, `init_logfmt()` and `init_human()`: install a
+  standard-output logger at `info` (or the `LOG_IO` filter) in one line,
+  returning the `FlushGuard`. `InitError` (`AlreadyInstalled`, `Filter`).
+- `FileSinkBuilder::follow_symlinks(bool)` and
+  `RotatingFileBuilder::follow_symlinks(bool)`.
+- `NonBlockingBuilder::max_queued_bytes(bytes)` and
+  `NonBlocking::queued_bytes()`.
+- `redact_key` patterns: a `*` matches any run of characters.
+
+### Fixed
+
+- logfmt rendered a lazy value (`%x`, `?x`, an error) once to decide on
+  quoting and again to write it, and wrote the second render unescaped
+  when the first needed no quotes. A value that rendered differently the
+  second time (shared state changed by another thread) could forge whole
+  log lines. Lazy values are now rendered once, in logfmt and in the
+  human layout, and the text that decided the quoting is the text
+  written. Without `std`, a value longer than 256 bytes is written
+  quoted and escaped.
+- File sinks followed symbolic links: `FileSink::create` truncated
+  whatever the path pointed to, and `FileSink::append` and
+  `RotatingFile` (also when reopening after each rotation) appended log
+  lines to it. The path must now be a regular file, not a symbolic link
+  (on Windows not a reparse point); on Unix the open uses `O_NOFOLLOW`
+  and the opened file is checked to be the one at the path, and
+  truncation happens only after the checks. `follow_symlinks(true)`
+  restores the earlier behaviour.
+- `NonBlocking` bounded its queue by record count only, so large records
+  pinned `capacity` times their size while the writer stalled (8192
+  records of a 64 KiB header held about 1 GiB). The queue now also has a
+  byte budget, 16 MiB by default, with the same overflow policy, and the
+  recycled-buffer pool keeps at most 256 buffers instead of `capacity`.
+
+### Changed
+
+- New log files are created with mode `0o600` on Unix (was `0o666`
+  minus the umask, usually `0o644`): logs often carry tokens and
+  personal data. `.mode(0o644)` restores the earlier behaviour. Existing
+  files keep their mode.
+- `LoggerBuilder::COMMON_SECRET_KEYS` (used by `redact_common_secrets`)
+  now holds patterns such as `*password*`, `*token*`, `*secret*`,
+  `*api_key*` and `*session_id*`, so compound names like `db_password`,
+  `X-Auth-Token` and `client_secret_v2` are redacted. They also catch
+  non-secret names such as `token_count`.
+- A `*` in a key passed to `redact_key` is now a wildcard.
+
 ## [2.1.0] - 2026-10-23
 
 Additive release: nothing that worked with 2.0 changes behaviour.
@@ -332,7 +387,8 @@ Initial repository scaffold: Apache-2.0 license, README, REPS
 specification stub and CI workflow. This version was not published to
 crates.io.
 
-[Unreleased]: https://github.com/jamesgober/log-io/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/jamesgober/log-io/compare/v2.2.0...HEAD
+[2.2.0]: https://github.com/jamesgober/log-io/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/jamesgober/log-io/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/jamesgober/log-io/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/jamesgober/log-io/compare/v0.10.0...v1.0.0

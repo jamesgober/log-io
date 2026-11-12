@@ -347,7 +347,7 @@ supported.
 | `no_timestamps()` / `no_context()` | on / on | skip the clock / thread context |
 | `with_default_field(k, v)` | | field on every record (same key replaces) |
 | `flush_on(Level)` | `Error` | flush every sink after records at or above it; `Off` disables |
-| `redact_key(k)` / `redact_common_secrets()` | none | replace values with `[REDACTED]`; case-insensitive, `-` matches `_` (`x-api-key`), last dotted segment matches |
+| `redact_key(k)` / `redact_common_secrets()` | none | replace values with `[REDACTED]`; case-insensitive, `-` matches `_` (`x-api-key`), last dotted segment matches, `*` matches any run (since 2.2: `*_token`, `db_*`); the common set uses patterns such as `*password*`, `*token*`, `*secret*` |
 | `on_error(handler)` | none | callback for sink, flush and format errors |
 | `with_sink`, `writer`, `stdout`, `stderr` | | install sinks |
 | `stdout_json`, `stderr_logfmt`, `stdout_human`, ... | | shortcuts per built-in format |
@@ -449,6 +449,22 @@ If the handler logs through a logger whose sink keeps failing, nested
 failures are not re-reported (no unbounded recursion).
 
 ## Global logger
+
+One line for the common case (since 2.2): `init_json`, `init_logfmt`
+and `init_human` install a standard-output logger at `info`, using the
+`LOG_IO` environment variable as the filter when it is set, and return
+the `FlushGuard`. They fail with `InitError::AlreadyInstalled`, or
+`InitError::Filter` when `LOG_IO` does not parse.
+
+```rust,no_run
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _guard = log_io::init_json()?;
+    log_io::info!("listening", port = 8080_u16);
+    Ok(())
+}
+```
+
+For anything else, build the logger:
 
 ```rust,no_run
 use log_io::{Level, Logger};
@@ -571,9 +587,21 @@ it can exceed `max_bytes` by up to the worker's `buffer_capacity`.
 set the Unix permission bits of every file the sink creates (for a
 rotating file: the active file and each new one after a rotation), such
 as `0o600` (owner only) or `0o640`. The process umask still applies, and
-an existing file keeps its mode. Without `mode` a new file gets `0o666`
-minus the umask, as in 2.0. On Windows files inherit their directory's
-access control list and `mode` has no effect.
+an existing file keeps its mode. Without `mode` a new file gets `0o600`
+(since 2.2; in 2.0 and 2.1 it got `0o666` minus the umask, usually
+`0o644`). Use `.mode(0o644)` for the earlier behaviour. On Windows files
+inherit their directory's access control list and `mode` has no effect.
+
+### Symbolic links (since 2.2)
+
+`FileSink` and `RotatingFile` refuse a log path that is a symbolic link
+(on Windows, any reparse point) or not a regular file, at open and at
+every reopen after a rotation. A link planted in a shared log directory
+then cannot redirect log lines into another file, and `FileSink::create`
+cannot truncate one. On Unix the open uses `O_NOFOLLOW`, and the opened
+file is checked to be the one at the path; truncation happens only after
+the checks. Deployments that rely on a linked log path set
+`follow_symlinks(true)` on the builder.
 
 ```rust,no_run
 use log_io::sink::{RotatingFile, Rotation};
@@ -630,6 +658,7 @@ use log_io::Logger;
 
 let sink = NonBlocking::builder(std::io::sink(), JsonFormat::new())
     .capacity(8192)                 // queued records
+    .max_queued_bytes(16 << 20)     // queued text (since 2.2)
     .overflow(Overflow::DropNewest) // or Overflow::Block (default, lossless)
     .buffer_capacity(64 * 1024)     // worker's write buffer
     .build()?;
@@ -659,6 +688,13 @@ logger.shutdown()?; // drains the queue and joins the worker
 - Queued strings are recycled, so a single producer does not allocate
   in steady state (the pool can take up to `capacity` records to warm
   up); under heavy contention some records allocate.
+- The queue holds at most `capacity` records and about
+  `max_queued_bytes` bytes of formatted text (16 MiB by default, since
+  2.2). Reaching either limit applies the overflow policy: `Block` waits
+  for the worker, `DropNewest` drops and counts. One record larger than
+  the budget is still queued when the queue is empty. `queued_bytes()`
+  reports the current amount. The recycled-buffer pool keeps at most 256
+  buffers.
 - `capacity` is clamped to `1..=1_048_576`; a thread name containing a
   NUL byte makes `build` return `Error::Configuration`.
 

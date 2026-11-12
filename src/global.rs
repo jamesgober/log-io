@@ -214,3 +214,118 @@ impl core::fmt::Display for SetGlobalError {
 }
 
 impl std::error::Error for SetGlobalError {}
+
+/// Error returned by [`init_json`], [`init_logfmt`] and [`init_human`].
+///
+/// # Examples
+///
+#[cfg_attr(feature = "json", doc = "```")]
+#[cfg_attr(not(feature = "json"), doc = "```ignore")]
+/// match log_io::init_json() {
+///     Ok(_guard) => { /* keep the guard alive in `main` */ }
+///     Err(log_io::InitError::AlreadyInstalled) => { /* someone else set it */ }
+///     Err(e) => eprintln!("logging not started: {e}"),
+/// }
+/// ```
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum InitError {
+    /// A global logger is already installed.
+    AlreadyInstalled,
+    /// The `LOG_IO` environment variable is set but did not parse.
+    Filter(crate::builder::BuildError),
+}
+
+impl core::fmt::Display for InitError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::AlreadyInstalled => f.write_str("a global logger is already installed"),
+            Self::Filter(e) => write!(f, "LOG_IO: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for InitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AlreadyInstalled => None,
+            Self::Filter(e) => Some(e),
+        }
+    }
+}
+
+/// Builds a standard-output logger at `info` (or the `LOG_IO` filter
+/// when that variable is set) with `sink`, and installs it globally.
+#[cfg(any(feature = "json", feature = "logfmt", feature = "human"))]
+fn init_stdout(
+    sink: impl FnOnce(crate::builder::LoggerBuilder) -> crate::builder::LoggerBuilder,
+) -> core::result::Result<FlushGuard, InitError> {
+    let logger = sink(Logger::builder().env_filter("LOG_IO"))
+        .try_build()
+        .map_err(InitError::Filter)?;
+    init(logger).map_err(|_| InitError::AlreadyInstalled)
+}
+
+/// Install a global logger that writes JSON lines to standard output, at
+/// `info`, or with the filter in the `LOG_IO` environment variable when
+/// it is set (for example `LOG_IO=debug,hyper=warn`). Keep the returned
+/// guard alive in `main`.
+///
+/// The one-line set-up; use [`Logger::builder`] and [`init`] for anything
+/// else.
+///
+/// # Errors
+///
+/// [`InitError::AlreadyInstalled`] if a global logger is already
+/// installed, [`InitError::Filter`] if `LOG_IO` is set but does not parse.
+///
+/// # Examples
+///
+/// ```no_run
+/// fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let _guard = log_io::init_json()?;
+///     log_io::info!("listening", port = 8080_u16);
+///     Ok(())
+/// }
+/// ```
+#[cfg(feature = "json")]
+pub fn init_json() -> core::result::Result<FlushGuard, InitError> {
+    init_stdout(crate::builder::LoggerBuilder::stdout_json)
+}
+
+/// As [`init_json`], writing logfmt (`key=value`) lines.
+///
+/// # Errors
+///
+/// As [`init_json`].
+///
+/// # Examples
+///
+/// ```no_run
+/// let _guard = log_io::init_logfmt()?;
+/// log_io::info!("listening", port = 8080_u16);
+/// # Ok::<(), log_io::InitError>(())
+/// ```
+#[cfg(feature = "logfmt")]
+pub fn init_logfmt() -> core::result::Result<FlushGuard, InitError> {
+    init_stdout(crate::builder::LoggerBuilder::stdout_logfmt)
+}
+
+/// As [`init_json`], writing the human-readable layout, coloured when
+/// standard output is a terminal.
+///
+/// # Errors
+///
+/// As [`init_json`].
+///
+/// # Examples
+///
+/// ```no_run
+/// let _guard = log_io::init_human()?;
+/// log_io::info!("listening", port = 8080_u16);
+/// # Ok::<(), log_io::InitError>(())
+/// ```
+#[cfg(feature = "human")]
+pub fn init_human() -> core::result::Result<FlushGuard, InitError> {
+    init_stdout(crate::builder::LoggerBuilder::stdout_human)
+}

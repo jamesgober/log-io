@@ -13,7 +13,7 @@ use core::fmt;
 use core::fmt::Write as _;
 
 use super::Format;
-use super::escape::{HumanEscaper, QuoteScan, value_needs_quotes, write_human_escaped};
+use super::escape::{HumanEscaper, render_once, value_needs_quotes, write_human_escaped};
 use crate::level::Level;
 use crate::record::Record;
 use crate::value::{Value, write_f64, write_hex};
@@ -215,22 +215,24 @@ fn write_value<W: fmt::Write + ?Sized>(w: &mut W, v: Value<'_>) -> fmt::Result {
         Value::Bytes([]) => w.write_str("\"\""),
         Value::Bytes(b) => write_hex(w, b),
         lazy @ (Value::Display(_) | Value::Debug(_) | Value::Error(_)) => {
-            // Rendered twice: once to decide on quoting, once to write.
-            let quoted = QuoteScan::needs_quotes(&lazy);
-            if quoted {
-                w.write_char('"')?;
-            }
-            write!(
-                HumanEscaper {
-                    inner: &mut *w,
-                    quoted,
-                },
-                "{lazy}"
-            )?;
-            if quoted {
-                w.write_char('"')?;
-            }
-            Ok(())
+            // Rendered once: the quoting decision and the output come
+            // from the same text.
+            render_once(&lazy, |text| match text {
+                Some(text) => write_str_value(w, text),
+                // Too long for the no-std stack buffer: always quoted,
+                // streamed through the escaper.
+                None => {
+                    w.write_char('"')?;
+                    write!(
+                        HumanEscaper {
+                            inner: &mut *w,
+                            quoted: true,
+                        },
+                        "{lazy}"
+                    )?;
+                    w.write_char('"')
+                }
+            })
         }
     }
 }

@@ -266,17 +266,137 @@ where
     result
 }
 
+/// Unix permission bits for a log file created without an explicit
+/// `mode`: owner read and write only (since 2.2; `0o666` minus the umask
+/// before).
+pub(crate) const DEFAULT_FILE_MODE: u32 = 0o600;
+
 /// Applies a Unix permission mode to files `options` creates. On other
 /// platforms the file inherits its directory's access control list and
 /// `mode` has no effect.
-pub(crate) fn apply_mode(options: &mut std::fs::OpenOptions, mode: Option<u32>) {
+pub(crate) fn apply_mode(options: &mut std::fs::OpenOptions, mode: u32) {
     #[cfg(unix)]
-    if let Some(mode) = mode {
+    {
         use std::os::unix::fs::OpenOptionsExt;
         let _options = options.mode(mode);
     }
     #[cfg(not(unix))]
     let _unused = (options, mode);
+}
+
+/// `O_NOFOLLOW` for the target, from the platform headers (the values the
+/// `libc` crate uses). `None` on Unix systems not listed: the checks in
+/// [`open_log_file`] still refuse a symbolic link there, but only after
+/// `open` has followed it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const O_NOFOLLOW: Option<i32> = Some(
+    if cfg!(any(
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "m68k"
+    )) {
+        0x8000
+    } else {
+        0x2_0000
+    },
+);
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+const O_NOFOLLOW: Option<i32> = Some(0x100);
+#[cfg(any(target_os = "solaris", target_os = "illumos"))]
+const O_NOFOLLOW: Option<i32> = Some(0x2_0000);
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "solaris",
+        target_os = "illumos"
+    ))
+))]
+const O_NOFOLLOW: Option<i32> = None;
+
+fn refuse(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+/// Opens (creating if needed) a log file for writing.
+///
+/// Unless `follow_symlinks` is set, the path must name a regular file,
+/// not a symbolic link (or, on Windows, another reparse point): a link
+/// planted in a shared log directory must not redirect, or truncate,
+/// another file. On Unix the open uses `O_NOFOLLOW` where the platform
+/// has it; everywhere the opened handle is then checked to be a regular
+/// file that is still the one at `path`. Truncation (`append == false`)
+/// happens only after those checks.
+///
+/// New files get `mode` (Unix), [`DEFAULT_FILE_MODE`] when `None`.
+pub(crate) fn open_log_file(
+    path: &std::path::Path,
+    append: bool,
+    mode: Option<u32>,
+    follow_symlinks: bool,
+) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    let _options = options.create(true).write(true).append(append);
+    apply_mode(&mut options, mode.unwrap_or(DEFAULT_FILE_MODE));
+    if !follow_symlinks {
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(refuse(
+                "log file path is a symbolic link; set follow_symlinks(true) to allow it",
+            ));
+        }
+        #[cfg(unix)]
+        if let Some(flag) = O_NOFOLLOW {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _options = options.custom_flags(flag);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // Opens a reparse point itself instead of its target.
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            let _options = options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+    }
+    let file = options.open(path)?;
+    if !follow_symlinks {
+        let opened = file.metadata()?;
+        if !opened.file_type().is_file() {
+            return Err(refuse("log file path is not a regular file"));
+        }
+        let named = std::fs::symlink_metadata(path)?;
+        if named.file_type().is_symlink() {
+            return Err(refuse(
+                "log file path is a symbolic link; set follow_symlinks(true) to allow it",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if (named.dev(), named.ino()) != (opened.dev(), opened.ino()) {
+                return Err(refuse(
+                    "log file path was replaced while it was being opened",
+                ));
+            }
+        }
+    }
+    if !append {
+        file.set_len(0)?;
+    }
+    Ok(file)
 }
 
 /// Acquire a mutex guard even if the mutex is poisoned.
