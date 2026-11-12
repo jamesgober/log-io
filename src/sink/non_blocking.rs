@@ -2,7 +2,7 @@
 
 use core::cell::Cell;
 use std::io::{self, BufWriter, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, TryLockError};
 use std::thread::JoinHandle;
@@ -65,6 +65,8 @@ pub(crate) fn on_background_worker() -> bool {
 }
 
 struct Shared {
+    /// Bytes of formatted text queued and not yet written.
+    queued_bytes: AtomicUsize,
     dropped: AtomicU64,
     write_errors: AtomicU64,
     /// First write error since the last flush; reported by `flush`.
@@ -90,9 +92,11 @@ struct Channel {
 /// This keeps file and socket I/O off request threads and async
 /// executor threads.
 ///
-/// * **Bounded:** at most `capacity` records are queued. What happens
-///   when the queue is full is set by [`Overflow`]; the default,
-///   [`Overflow::Block`], never drops a record.
+/// * **Bounded:** at most `capacity` records, and about
+///   `max_queued_bytes` bytes of formatted text (16 MiB by default), are
+///   queued. What happens when either limit is reached is set by
+///   [`Overflow`]; the default, [`Overflow::Block`], never drops a
+///   record.
 /// * **Flush:** [`Sink::flush`] waits until every record queued before
 ///   it has been written and the writer flushed.
 /// * **Shutdown:** [`Sink::shutdown`] (called by
@@ -158,11 +162,12 @@ pub struct NonBlocking<F: Format> {
     fallback: Mutex<Option<Box<dyn Write + Send>>>,
     pool: Mutex<Receiver<String>>,
     shared: Arc<Shared>,
+    max_queued_bytes: usize,
 }
 
 impl<F: Format> NonBlocking<F> {
     /// Start a background writer with default options: capacity 8192,
-    /// [`Overflow::Block`].
+    /// 16 MiB of queued text, [`Overflow::Block`].
     ///
     /// # Errors
     ///
@@ -177,6 +182,7 @@ impl<F: Format> NonBlocking<F> {
             writer: Box::new(writer),
             format,
             capacity: 8192,
+            max_queued_bytes: DEFAULT_MAX_QUEUED_BYTES,
             overflow: Overflow::Block,
             buffer_capacity: 64 * 1024,
             thread_name: String::from("log-io-writer"),
@@ -195,6 +201,24 @@ impl<F: Format> NonBlocking<F> {
     #[must_use]
     pub fn write_errors(&self) -> u64 {
         self.shared.write_errors.load(Ordering::Relaxed)
+    }
+
+    /// Bytes of formatted text queued and not yet written.
+    #[must_use]
+    pub fn queued_bytes(&self) -> usize {
+        self.shared.queued_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Whether a record of `len` bytes fits the byte budget. A record
+    /// always fits an empty queue, so one larger than the budget is still
+    /// written, alone.
+    fn fits(&self, len: usize) -> bool {
+        let queued = self.shared.queued_bytes.load(Ordering::Relaxed);
+        queued == 0 || queued.saturating_add(len) <= self.max_queued_bytes
+    }
+
+    fn unqueue(&self, len: usize) {
+        let _previous = self.shared.queued_bytes.fetch_sub(len, Ordering::Relaxed);
     }
 
     fn take_buffer(&self) -> String {
@@ -277,17 +301,40 @@ impl<F: Format> Sink for NonBlocking<F> {
             return Ok(());
         };
         if let Some(sender) = &channel.sender {
+            let len = text.len();
+            let may_block = matches!(self.overflow, Overflow::Block) && !self.on_own_worker();
+            while !self.fits(len) {
+                if !may_block {
+                    self.count_drop();
+                    return Ok(());
+                }
+                // Over the byte budget: wait until the worker has written
+                // everything queued so far.
+                let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+                sender
+                    .send(Message::Flush(ack_tx))
+                    .map_err(|_| Error::Closed)?;
+                let _flushed = ack_rx.recv().map_err(|_| Error::Closed)?;
+            }
+            let _previous = self.shared.queued_bytes.fetch_add(len, Ordering::Relaxed);
             return match sender.try_send(Message::Record(text)) {
                 Ok(()) => Ok(()),
                 Err(TrySendError::Full(message)) => {
-                    if matches!(self.overflow, Overflow::Block) && !self.on_own_worker() {
-                        sender.send(message).map_err(|_| Error::Closed)
+                    if may_block {
+                        sender.send(message).map_err(|_| {
+                            self.unqueue(len);
+                            Error::Closed
+                        })
                     } else {
+                        self.unqueue(len);
                         self.count_drop();
                         Ok(())
                     }
                 }
-                Err(TrySendError::Disconnected(_)) => Err(Error::Closed),
+                Err(TrySendError::Disconnected(_)) => {
+                    self.unqueue(len);
+                    Err(Error::Closed)
+                }
             };
         }
         drop(channel);
@@ -385,6 +432,7 @@ pub struct NonBlockingBuilder<F> {
     writer: Box<dyn Write + Send>,
     format: F,
     capacity: usize,
+    max_queued_bytes: usize,
     overflow: Overflow,
     buffer_capacity: usize,
     thread_name: String,
@@ -396,12 +444,36 @@ pub struct NonBlockingBuilder<F> {
 /// reserve memory (or overflow the allocation size).
 const MAX_CAPACITY: usize = 1 << 20;
 
+/// Default byte budget for queued text: 16 MiB.
+const DEFAULT_MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
+
+/// Most recycled buffers kept for reuse. Each may hold up to 64 KiB, so
+/// the pool retains at most 16 MiB (up to 2.1 it kept one per queue slot,
+/// up to 512 MiB at the default capacity).
+const MAX_POOLED: usize = 256;
+
 impl<F: Format> NonBlockingBuilder<F> {
     /// Maximum number of queued records. Default 8192. Values are
     /// clamped to `1..=1_048_576` (2^20); the queue preallocates a slot
     /// per record.
     pub fn capacity(mut self, records: usize) -> Self {
         self.capacity = records.clamp(1, MAX_CAPACITY);
+        self
+    }
+
+    /// Maximum bytes of formatted text in the queue. Default 16 MiB.
+    ///
+    /// The record count alone does not bound memory: 8192 records of a
+    /// 64 KiB attacker-chosen header pin about 1 GiB while the writer
+    /// stalls. When a record would take the queue past this budget the
+    /// [`Overflow`] policy applies, as for a full queue: `Block` waits
+    /// until the worker has written what is queued, `DropNewest` drops
+    /// the record. A record larger than the budget is still queued when
+    /// the queue is empty. The budget counts text length; concurrent
+    /// producers can pass it by up to one record each. `usize::MAX`
+    /// disables it; `0` is treated as `1`.
+    pub fn max_queued_bytes(mut self, bytes: usize) -> Self {
+        self.max_queued_bytes = bytes.max(1);
         self
     }
 
@@ -444,8 +516,9 @@ impl<F: Format> NonBlockingBuilder<F> {
             ));
         }
         let (tx, rx) = mpsc::sync_channel::<Message>(self.capacity);
-        let (pool_tx, pool_rx) = mpsc::sync_channel::<String>(self.capacity);
+        let (pool_tx, pool_rx) = mpsc::sync_channel::<String>(self.capacity.min(MAX_POOLED));
         let shared = Arc::new(Shared {
+            queued_bytes: AtomicUsize::new(0),
             dropped: AtomicU64::new(0),
             write_errors: AtomicU64::new(0),
             deferred: Mutex::new(None),
@@ -470,6 +543,7 @@ impl<F: Format> NonBlockingBuilder<F> {
             fallback: Mutex::new(None),
             pool: Mutex::new(pool_rx),
             shared,
+            max_queued_bytes: self.max_queued_bytes,
         })
     }
 }
@@ -479,6 +553,7 @@ impl<F: core::fmt::Debug> core::fmt::Debug for NonBlockingBuilder<F> {
         f.debug_struct("NonBlockingBuilder")
             .field("format", &self.format)
             .field("capacity", &self.capacity)
+            .field("max_queued_bytes", &self.max_queued_bytes)
             .field("overflow", &self.overflow)
             .field("thread_name", &self.thread_name)
             .finish_non_exhaustive()
@@ -526,6 +601,7 @@ fn run_worker(
                 if let Err(e) = writer.write_all(text.as_bytes()) {
                     report(shared, e);
                 }
+                let _previous = shared.queued_bytes.fetch_sub(text.len(), Ordering::Relaxed);
                 dirty = true;
                 trim_buffer(&mut text);
                 // Recycle the buffer; if the pool is full it is freed.
@@ -760,6 +836,50 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    // Review F-3 (2.1.0): the queue was bounded by record count only, so
+    // large records pinned `capacity` times their size while the writer
+    // stalled (1024 records of 256 KiB held 512 MiB).
+    #[test]
+    fn test_non_blocking_queue_is_bounded_in_bytes() {
+        let (release, gate) = mpsc::channel();
+        let out = Capture::default();
+        let sink = NonBlocking::builder(Stall(Some(gate), out.clone()), JsonFormat::new())
+            .capacity(1024)
+            .overflow(Overflow::DropNewest)
+            .buffer_capacity(0)
+            .build()
+            .unwrap();
+        let big = "x".repeat(256 * 1024);
+        for _ in 0..256 {
+            sink.write_record(&record(&big)).unwrap();
+        }
+        let queued = sink.queued_bytes();
+        let limit = DEFAULT_MAX_QUEUED_BYTES + big.len() + 1024;
+        release.send(()).unwrap();
+        sink.flush().unwrap();
+        assert!(queued <= limit, "{queued} bytes queued");
+        assert!(sink.dropped() > 0, "the byte budget must have been hit");
+        assert_eq!(out.lines() as u64 + sink.dropped(), 256);
+        assert_eq!(sink.queued_bytes(), 0);
+    }
+
+    #[test]
+    fn test_non_blocking_block_waits_for_the_byte_budget_and_loses_nothing() {
+        let out = Capture::default();
+        let sink = NonBlocking::builder(out.clone(), JsonFormat::new())
+            .max_queued_bytes(4 * 1024)
+            .build()
+            .unwrap();
+        let text = "y".repeat(1024);
+        for _ in 0..200 {
+            sink.write_record(&record(&text)).unwrap();
+        }
+        sink.flush().unwrap();
+        assert_eq!(out.lines(), 200);
+        assert_eq!(sink.dropped(), 0);
+        assert_eq!(sink.queued_bytes(), 0);
     }
 
     #[test]

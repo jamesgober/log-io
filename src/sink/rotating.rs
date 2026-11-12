@@ -1,7 +1,7 @@
 //! Size- and time-based rotating file writer.
 
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -115,6 +115,8 @@ pub struct RotatingFile {
     buffer_capacity: usize,
     /// Unix permission bits for files this writer creates.
     mode: Option<u32>,
+    /// Allow the path to be a symbolic link.
+    follow_symlinks: bool,
     /// Index of the UTC period the active file belongs to.
     period: Option<u64>,
     /// A rotation failure waiting to be reported by `flush`.
@@ -124,7 +126,8 @@ pub struct RotatingFile {
 
 impl RotatingFile {
     /// Start configuring a rotating file at `path`. Defaults: no size
-    /// limit, [`Rotation::Never`], keep 5 rotated files, 8 KiB buffer.
+    /// limit, [`Rotation::Never`], keep 5 rotated files, 8 KiB buffer,
+    /// mode `0o600` for new files (Unix), symbolic links refused.
     pub fn builder(path: impl AsRef<Path>) -> RotatingFileBuilder {
         RotatingFileBuilder {
             path: path.as_ref().to_path_buf(),
@@ -133,6 +136,7 @@ impl RotatingFile {
             max_files: 5,
             buffer_capacity: 8 * 1024,
             mode: None,
+            follow_symlinks: false,
         }
     }
 
@@ -199,7 +203,12 @@ impl RotatingFile {
             drop(writer);
         }
         let rotated = self.move_active_into_history();
-        let reopened = open_append(&self.path, self.buffer_capacity, self.mode);
+        let reopened = open_append(
+            &self.path,
+            self.buffer_capacity,
+            self.mode,
+            self.follow_symlinks,
+        );
         match reopened {
             Ok((writer, size)) => {
                 self.file = Some(writer);
@@ -346,7 +355,12 @@ impl Write for RotatingFile {
         let writer = match self.file.as_mut() {
             Some(w) => w,
             None => {
-                let (writer, size) = open_append(&self.path, self.buffer_capacity, self.mode)?;
+                let (writer, size) = open_append(
+                    &self.path,
+                    self.buffer_capacity,
+                    self.mode,
+                    self.follow_symlinks,
+                )?;
                 self.size = size;
                 self.file.insert(writer)
             }
@@ -399,6 +413,7 @@ pub struct RotatingFileBuilder {
     max_files: usize,
     buffer_capacity: usize,
     mode: Option<u32>,
+    follow_symlinks: bool,
 }
 
 impl RotatingFileBuilder {
@@ -430,9 +445,11 @@ impl RotatingFileBuilder {
     /// Unix permission bits for every file this writer creates: the active
     /// file and each new one after a rotation, such as `0o600` or `0o640`.
     /// The process umask still applies, and an existing file keeps its
-    /// mode. Without this call files get `0o666` minus the umask, as
-    /// before 2.1. On Windows files inherit their directory's access
-    /// control list and the mode has no effect.
+    /// mode. Without this call new files get `0o600` (since 2.2; logs
+    /// often carry tokens and personal data). Use `.mode(0o644)` for the
+    /// earlier behaviour (`0o666` minus the usual umask). On Windows files
+    /// inherit their directory's access control list and the mode has no
+    /// effect.
     ///
     /// # Examples
     ///
@@ -450,6 +467,17 @@ impl RotatingFileBuilder {
         self
     }
 
+    /// Allow the path to be a symbolic link (`true`). Default `false`
+    /// (since 2.2): opening, and reopening after every rotation, fails
+    /// when the path is a symbolic link (on Windows any reparse point) or
+    /// not a regular file, so a link planted in a shared log directory
+    /// between rotations cannot redirect log lines into another file. A
+    /// failed reopen is reported like any rotation error.
+    pub const fn follow_symlinks(mut self, follow: bool) -> Self {
+        self.follow_symlinks = follow;
+        self
+    }
+
     /// Open (or create) the active file in append mode.
     ///
     /// If the file already exists and was last modified in an earlier
@@ -463,7 +491,12 @@ impl RotatingFileBuilder {
     }
 
     fn open_with_clock(self, now: fn() -> SystemTime) -> io::Result<RotatingFile> {
-        let (writer, size) = open_append(&self.path, self.buffer_capacity, self.mode)?;
+        let (writer, size) = open_append(
+            &self.path,
+            self.buffer_capacity,
+            self.mode,
+            self.follow_symlinks,
+        )?;
         let period = self.rotation.period_secs().map(|p| {
             let started = if size > 0 {
                 writer
@@ -485,6 +518,7 @@ impl RotatingFileBuilder {
             max_files: self.max_files,
             buffer_capacity: self.buffer_capacity,
             mode: self.mode,
+            follow_symlinks: self.follow_symlinks,
             period,
             deferred_error: None,
             now,
@@ -496,11 +530,9 @@ fn open_append(
     path: &Path,
     capacity: usize,
     mode: Option<u32>,
+    follow_symlinks: bool,
 ) -> io::Result<(BufWriter<File>, u64)> {
-    let mut options = OpenOptions::new();
-    let _options = options.create(true).append(true);
-    super::apply_mode(&mut options, mode);
-    let file = options.open(path)?;
+    let file = super::open_log_file(path, true, mode, follow_symlinks)?;
     let size = file.metadata()?.len();
     Ok((BufWriter::with_capacity(capacity, file), size))
 }
@@ -922,7 +954,7 @@ mod tests {
             .unwrap();
         w.write_all(b"11111").unwrap();
         seed_history(&dir, "held.log", 3);
-        let holder = OpenOptions::new()
+        let holder = fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .open(&path)
@@ -977,5 +1009,47 @@ mod tests {
             let mode = fs::metadata(dir.file(name)).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{name}");
         }
+    }
+
+    // Review F-2 (2.1.0): the reopen after a rotation followed a symbolic
+    // link planted at the path in between, and appended log lines to the
+    // file it pointed to.
+    #[cfg(unix)]
+    #[test]
+    fn test_rotating_reopen_refuses_a_symlink_planted_after_rotation() {
+        let dir = TempDir::new("symlink");
+        let victim = dir.file("victim.txt");
+        fs::write(&victim, "important=1\n").unwrap();
+        let mut w = RotatingFile::builder(dir.file("app.log"))
+            .max_bytes(5)
+            .max_files(2)
+            .buffer_capacity(0)
+            .open()
+            .unwrap();
+        w.write_all(b"11111").unwrap();
+        // Close the active file the way a rotation does, then plant a link.
+        w.rotate_now().unwrap();
+        fs::remove_file(dir.file("app.log")).unwrap();
+        std::os::unix::fs::symlink(&victim, dir.file("app.log")).unwrap();
+        w.rotate_now().ok();
+        let _ = w.write_all(b"appended-by-logger");
+        let _ = w.flush();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "important=1\n");
+    }
+
+    // Review F-4 (2.1.0): new log files were world readable by default.
+    #[cfg(unix)]
+    #[test]
+    fn test_rotating_default_mode_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("default-mode");
+        let w = RotatingFile::builder(dir.file("app.log")).open().unwrap();
+        drop(w);
+        let mode = fs::metadata(dir.file("app.log"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

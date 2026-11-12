@@ -12,7 +12,7 @@ use core::fmt::Write as _;
 
 use super::Format;
 use super::escape::{
-    JsonEscaper, QuoteScan, RESERVED_PREFIX, is_reserved_key, value_needs_quotes,
+    JsonEscaper, RESERVED_PREFIX, is_reserved_key, render_once, value_needs_quotes,
     write_json_escaped, write_sanitized_key,
 };
 use crate::record::Record;
@@ -144,14 +144,19 @@ fn write_value<W: fmt::Write + ?Sized>(w: &mut W, v: Value<'_>) -> fmt::Result {
         Value::Bytes([]) => w.write_str("\"\""),
         Value::Bytes(b) => write_hex(w, b),
         lazy @ (Value::Display(_) | Value::Debug(_) | Value::Error(_)) => {
-            // Rendered twice: once to decide on quoting, once to write.
-            if QuoteScan::needs_quotes(&lazy) {
-                w.write_char('"')?;
-                write!(JsonEscaper(&mut *w), "{lazy}")?;
-                w.write_char('"')
-            } else {
-                write!(w, "{lazy}")
-            }
+            // Rendered once: the quoting decision and the output come
+            // from the same text, so a value that renders differently
+            // each time cannot slip unescaped text through.
+            render_once(&lazy, |text| match text {
+                Some(text) => write_str_value(w, text),
+                // Too long for the no-std stack buffer: always quoted,
+                // streamed through the escaper.
+                None => {
+                    w.write_char('"')?;
+                    write!(JsonEscaper(&mut *w), "{lazy}")?;
+                    w.write_char('"')
+                }
+            })
         }
     }
 }
@@ -177,6 +182,48 @@ mod tests {
         let out = fmt_one(LogfmtFormat::new(), &record);
         let start = out.find(" v=").unwrap() + 3;
         out[start..out.len() - 1].to_string()
+    }
+
+    /// Renders clean text the first time and an injection the next.
+    struct Changing(core::cell::Cell<u32>);
+
+    impl core::fmt::Display for Changing {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let n = self.0.get();
+            self.0.set(n + 1);
+            if n == 0 {
+                f.write_str("clean")
+            } else {
+                f.write_str("clean\nlevel=error message=forged\u{1b}[2J")
+            }
+        }
+    }
+
+    // Review F-1 (2.1.0): a lazy value was rendered once to decide on
+    // quoting and again to write; when the first render looked clean
+    // the second was written unescaped, so a value that changed between
+    // renders forged log lines.
+    #[test]
+    fn test_logfmt_lazy_value_is_rendered_once() {
+        fn once(value: &Changing) -> String {
+            let fields = [Field::new("v", Value::Display(value))];
+            let record = Record::new(Metadata::new(Level::Info, "t"), "m", &fields);
+            let mut out = String::new();
+            LogfmtFormat::new()
+                .write_record_generic(&record, &mut out)
+                .unwrap();
+            let start = out.find(" v=").unwrap() + 3;
+            out[start..out.len() - 1].to_string()
+        }
+        let value = Changing(core::cell::Cell::new(0));
+        let out = once(&value);
+        assert_eq!(out, "clean");
+        assert_eq!(value.0.get(), 1, "rendered more than once");
+        // The same value, now rendering the hostile text, stays on one
+        // escaped line.
+        let out = once(&value);
+        assert!(!out.contains('\n') && !out.contains('\u{1b}'), "{out:?}");
+        assert!(out.starts_with('"') && out.ends_with('"'), "{out:?}");
     }
 
     #[test]

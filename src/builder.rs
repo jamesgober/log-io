@@ -90,36 +90,36 @@ pub struct LoggerBuilder {
 }
 
 impl LoggerBuilder {
-    /// Keys redacted by [`LoggerBuilder::redact_common_secrets`].
+    /// Key patterns redacted by [`LoggerBuilder::redact_common_secrets`].
     ///
-    /// Matching treats `-` and `_` alike, so `api_key` also covers the
-    /// HTTP header names `api-key` and `x-api-key` (via `x_api_key`),
-    /// and `set_cookie` covers `set-cookie`. Matching is otherwise
-    /// exact: `user_password` is not covered by `password`; add such
-    /// keys with [`LoggerBuilder::redact_key`].
+    /// Each `*` matches any run of characters (see
+    /// [`LoggerBuilder::redact_key`]), so `*password*` covers `password`,
+    /// `db_password` and `user_password_hash`, and `*token*` covers
+    /// `x-auth-token` and `refresh_token`. Matching treats `-` and `_`
+    /// alike and ignores ASCII case, so `*api_key*` also covers the HTTP
+    /// header names `Api-Key` and `X-Api-Key`.
+    ///
+    /// The patterns favour catching secrets over keeping every value:
+    /// `*token*` also redacts a count such as `token_count`. Rename such
+    /// fields, or list your own keys with [`LoggerBuilder::redact_key`]
+    /// instead of this set. (Before 2.2 the set held exact names only.)
     pub const COMMON_SECRET_KEYS: &'static [&'static str] = &[
-        "password",
-        "passwd",
-        "secret",
-        "secret_key",
-        "client_secret",
-        "token",
-        "access_token",
-        "refresh_token",
-        "id_token",
-        "auth_token",
-        "session_token",
-        "jwt",
-        "api_key",
-        "apikey",
-        "x_api_key",
-        "authorization",
-        "proxy_authorization",
-        "cookie",
-        "set_cookie",
-        "private_key",
-        "privatekey",
-        "credentials",
+        "*password*",
+        "*passwd*",
+        "*passphrase*",
+        "*secret*",
+        "*token*",
+        "*jwt*",
+        "*bearer*",
+        "*api_key*",
+        "*apikey*",
+        "*authorization*",
+        "*cookie*",
+        "*private_key*",
+        "*privatekey*",
+        "*credential*",
+        "*session_id*",
+        "*sessionid*",
     ];
 
     pub(crate) fn new() -> Self {
@@ -283,6 +283,14 @@ impl LoggerBuilder {
     /// same character (so `api_key` covers the header name `Api-Key`),
     /// and also tests the last dot-separated segment of a key (so
     /// `password` covers `db.password`).
+    ///
+    /// A `*` in `key` matches any run of characters, including none
+    /// (since 2.2): `*_secret` covers `client_secret`, `db_*` covers
+    /// every key starting with `db_`, and `*token*` any key containing
+    /// `token`. Without a `*` the key must match exactly.
+    ///
+    /// Only keys are matched. A secret inside a `Debug` or `Display`
+    /// value (`req = ?login_form`) or in the message text is not seen.
     pub fn redact_key(mut self, key: impl Into<String>) -> Self {
         let key = crate::logger::normalize_redact_key(&key.into()).into_boxed_str();
         if !self.redact.contains(&key) {
@@ -586,13 +594,13 @@ mod tests {
     #[test]
     fn test_redact_keys_are_lowercased_and_deduplicated() {
         let builder = Logger::builder()
-            .redact_key("Token")
-            .redact_key("token")
+            .redact_key("*Token*")
+            .redact_key("*token*")
             .redact_common_secrets();
         assert_eq!(
             builder.redact.len(),
             LoggerBuilder::COMMON_SECRET_KEYS.len(),
-            "token appears once"
+            "*token* appears once"
         );
         let text = format!("{builder:?}");
         assert!(text.contains("token"), "{text}");

@@ -83,6 +83,19 @@ log-io = { version = "2", features = [
 
 ## Quick Start
 
+One line installs a JSON logger on standard output (`info`, or the
+filter in `LOG_IO`); `init_logfmt` and `init_human` pick the other
+layouts:
+
+```rust,no_run
+let _guard = log_io::init_json()?;
+let port = 8080_u16;
+log_io::info!("listening on port {port}", tls = true);
+# Ok::<(), log_io::InitError>(())
+```
+
+To configure it, build the logger:
+
 ```rust
 use log_io::{Level, Logger};
 

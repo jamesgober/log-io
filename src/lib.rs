@@ -155,8 +155,14 @@ pub use crate::builder::{BuildError, LoggerBuilder};
 pub use crate::error::{Error, Result};
 #[cfg(feature = "std")]
 pub use crate::filter::{Filter, FilterRule, ParseFilterError, ParseFilterErrorKind};
+#[cfg(all(feature = "std", feature = "human"))]
+pub use crate::global::init_human;
+#[cfg(all(feature = "std", feature = "json"))]
+pub use crate::global::init_json;
+#[cfg(all(feature = "std", feature = "logfmt"))]
+pub use crate::global::init_logfmt;
 #[cfg(feature = "std")]
-pub use crate::global::{FlushGuard, SetGlobalError, init, set as set_global};
+pub use crate::global::{FlushGuard, InitError, SetGlobalError, init, set as set_global};
 #[cfg(feature = "std")]
 pub use crate::logger::{ErrorHandler, Logger, REDACTED};
 #[cfg(feature = "std")]

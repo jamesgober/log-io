@@ -559,19 +559,54 @@ pub(crate) fn normalize_redact_key(key: &str) -> String {
         .collect()
 }
 
-/// `true` if `key` matches the normalized redaction key `normalized`.
-/// Allocation-free; compares byte by byte.
+/// One byte of a key in canonical form (see [`normalize_redact_key`]).
+#[inline]
+const fn fold_key_byte(b: u8) -> u8 {
+    if b == b'-' {
+        b'_'
+    } else {
+        b.to_ascii_lowercase()
+    }
+}
+
+/// `true` if `key` matches the normalized redaction key `normalized`,
+/// in which each `*` matches any run of bytes. Allocation-free.
 #[inline]
 fn redact_key_matches(normalized: &str, key: &str) -> bool {
-    normalized.len() == key.len()
-        && normalized.bytes().zip(key.bytes()).all(|(r, k)| {
-            let k = if k == b'-' {
-                b'_'
-            } else {
-                k.to_ascii_lowercase()
-            };
-            r == k
-        })
+    let pattern = normalized.as_bytes();
+    let key = key.as_bytes();
+    if !pattern.contains(&b'*') {
+        return pattern.len() == key.len()
+            && pattern
+                .iter()
+                .zip(key)
+                .all(|(r, k)| *r == fold_key_byte(*k));
+    }
+    // Wildcard match with single-star backtracking: linear in practice,
+    // `O(pattern * key)` at worst, and keys are short.
+    let (mut p, mut k) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while k < key.len() {
+        match pattern.get(p) {
+            Some(b'*') => {
+                star = Some((p, k));
+                p += 1;
+            }
+            Some(r) if *r == fold_key_byte(key[k]) => {
+                p += 1;
+                k += 1;
+            }
+            _ => match star {
+                Some((sp, sk)) => {
+                    p = sp + 1;
+                    k = sk + 1;
+                    star = Some((sp, sk + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|b| *b == b'*')
 }
 
 fn any_key_in(a: &[Field<'_>], b: &[Field<'_>]) -> bool {
@@ -906,6 +941,59 @@ mod tests {
         assert!(out.contains("user=alice"), "{out}");
         assert_eq!(out.matches(REDACTED).count(), 4, "{out}");
         context::clear();
+    }
+
+    // Review F-5 (2.1.0): the common set matched exact names only, so
+    // compound names such as `db_password` and `x-auth-token` passed
+    // through.
+    #[test]
+    fn test_common_secrets_catch_compound_key_names() {
+        let buf = MemBuf::default();
+        let logger = Logger::builder()
+            .level(Level::Trace)
+            .no_timestamps()
+            .redact_common_secrets()
+            .writer(buf.clone(), LogfmtFormat::new())
+            .build();
+        logger.log(
+            Level::Info,
+            "login",
+            &[
+                Field::new("db_password", "S3CRET-1"),
+                Field::new("user_password", "S3CRET-2"),
+                Field::new("X-Auth-Token", "S3CRET-3"),
+                Field::new("client_secret_v2", "S3CRET-4"),
+                Field::new("session_id", "S3CRET-5"),
+                Field::new("passphrase", "S3CRET-6"),
+                Field::new("upstream.Api-Key", "S3CRET-7"),
+                Field::new("user", "alice"),
+                Field::new("status", "ok"),
+            ],
+        );
+        let out = buf.text();
+        for n in 1..=7 {
+            assert!(
+                !out.contains(&format!("S3CRET-{n}")),
+                "S3CRET-{n} leaked: {out}"
+            );
+        }
+        assert!(out.contains("user=alice"), "{out}");
+        assert!(out.contains("status=ok"), "{out}");
+    }
+
+    #[test]
+    fn test_redact_key_wildcards() {
+        let m = |p: &str, k: &str| redact_key_matches(&normalize_redact_key(p), k);
+        assert!(m("db_*", "DB-host"));
+        assert!(m("*_secret", "client_secret"));
+        assert!(!m("*_secret", "client_secret_v2"));
+        assert!(m("*token*", "token"));
+        assert!(m("a*b*c", "aXXbYYc"));
+        assert!(!m("a*b*c", "aXXbYY"));
+        assert!(m("*", ""));
+        assert!(m("password", "PassWord"));
+        assert!(!m("password", "db_password"));
+        assert!(!m("", "x"));
     }
 
     #[test]

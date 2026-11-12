@@ -249,41 +249,109 @@ impl<W: fmt::Write + ?Sized> fmt::Write for HumanEscaper<'_, W> {
     }
 }
 
-#[cfg(any(feature = "logfmt", feature = "human"))]
-/// A sink that only decides whether rendered text needs quoting.
-///
-/// Used for lazily formatted values (`Display` / `Debug` / `Error`) in
-/// logfmt and the human format: the value is rendered once into this
-/// scanner, which stops early (by returning `Err`) as soon as quoting
-/// is known to be required, and then rendered again into the output.
-#[derive(Default)]
-pub(crate) struct QuoteScan {
-    pub(crate) needs_quotes: bool,
-    pub(crate) saw_text: bool,
+#[cfg(all(any(feature = "logfmt", feature = "human"), feature = "std"))]
+std::thread_local! {
+    /// Scratch buffer for [`render_once`].
+    static RENDER_BUF: core::cell::RefCell<std::string::String> =
+        const { core::cell::RefCell::new(std::string::String::new()) };
 }
 
+/// Capacity [`render_once`]'s scratch buffer may keep between values.
+#[cfg(all(any(feature = "logfmt", feature = "human"), feature = "std"))]
+const MAX_RENDER_CAPACITY: usize = 16 * 1024;
+
 #[cfg(any(feature = "logfmt", feature = "human"))]
-impl fmt::Write for QuoteScan {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        if s.is_empty() {
-            return Ok(());
+/// Render a lazily formatted value (`Display` / `Debug` / `Error`)
+/// exactly once and pass the text to `write`.
+///
+/// logfmt and the human format decide on quoting from the text, then
+/// write that same text. Up to 2.1 they rendered the value twice (once
+/// to decide, once to write) and logfmt wrote the second render
+/// unescaped when the first needed no quotes: a value that rendered
+/// differently the second time could forge whole log lines.
+///
+/// With `std` the text goes into a thread-local buffer (a fresh one when
+/// a value's `Display` itself logs). Without `std` it goes into a
+/// 256-byte stack buffer; a longer value calls `write` with `None`, and
+/// the caller then writes it quoted, streamed through the escaper.
+pub(crate) fn render_once(
+    value: &dyn fmt::Display,
+    write: impl FnOnce(Option<&str>) -> fmt::Result,
+) -> fmt::Result {
+    #[cfg(feature = "std")]
+    {
+        if RENDER_BUF.try_with(|_| ()).is_ok() {
+            RENDER_BUF.with(|cell| match cell.try_borrow_mut() {
+                Ok(mut buf) => render_into(&mut buf, value, write),
+                // A value's `Display` that logs: use a temporary buffer.
+                Err(_) => render_into(&mut std::string::String::new(), value, write),
+            })
+        } else {
+            // Thread-local storage is being torn down.
+            render_into(&mut std::string::String::new(), value, write)
         }
-        self.saw_text = true;
-        if value_needs_quotes(s) {
-            self.needs_quotes = true;
-            return Err(fmt::Error);
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let mut buf = StackBuf {
+            bytes: [0; STACK_RENDER],
+            len: 0,
+            overflow: false,
+        };
+        match fmt::write(&mut buf, format_args!("{value}")) {
+            Ok(()) => match core::str::from_utf8(&buf.bytes[..buf.len]) {
+                Ok(text) => write(Some(text)),
+                Err(_) => write(None),
+            },
+            Err(_) if buf.overflow => write(None),
+            Err(e) => Err(e),
         }
-        Ok(())
     }
 }
 
-#[cfg(any(feature = "logfmt", feature = "human"))]
-impl QuoteScan {
-    /// Decide whether `value`'s rendered text must be quoted.
-    pub(crate) fn needs_quotes(value: &dyn fmt::Display) -> bool {
-        let mut scan = Self::default();
-        let rendered = fmt::write(&mut scan, format_args!("{value}"));
-        scan.needs_quotes || !scan.saw_text || rendered.is_err()
+#[cfg(all(any(feature = "logfmt", feature = "human"), feature = "std"))]
+fn render_into(
+    buf: &mut std::string::String,
+    value: &dyn fmt::Display,
+    write: impl FnOnce(Option<&str>) -> fmt::Result,
+) -> fmt::Result {
+    buf.clear();
+    let result = match fmt::write(buf, format_args!("{value}")) {
+        Ok(()) => write(Some(buf.as_str())),
+        Err(e) => Err(e),
+    };
+    buf.clear();
+    if buf.capacity() > MAX_RENDER_CAPACITY {
+        buf.shrink_to(MAX_RENDER_CAPACITY);
+    }
+    result
+}
+
+#[cfg(all(any(feature = "logfmt", feature = "human"), not(feature = "std")))]
+const STACK_RENDER: usize = 256;
+
+#[cfg(all(any(feature = "logfmt", feature = "human"), not(feature = "std")))]
+struct StackBuf {
+    bytes: [u8; STACK_RENDER],
+    len: usize,
+    overflow: bool,
+}
+
+#[cfg(all(any(feature = "logfmt", feature = "human"), not(feature = "std")))]
+impl fmt::Write for StackBuf {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let end = self.len + s.len();
+        match self.bytes.get_mut(self.len..end) {
+            Some(slot) => {
+                slot.copy_from_slice(s.as_bytes());
+                self.len = end;
+                Ok(())
+            }
+            None => {
+                self.overflow = true;
+                Err(fmt::Error)
+            }
+        }
     }
 }
 
@@ -417,10 +485,38 @@ mod tests {
     }
 
     #[test]
-    fn test_quote_scan_decides_from_rendered_text() {
-        assert!(!QuoteScan::needs_quotes(&42));
-        assert!(QuoteScan::needs_quotes(&"two words"));
-        assert!(QuoteScan::needs_quotes(&""));
+    fn test_render_once_passes_the_rendered_text() {
+        let mut seen = String::new();
+        render_once(&42, |text| {
+            seen.push_str(text.unwrap_or("<none>"));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, "42");
+    }
+
+    #[test]
+    fn test_render_once_is_reentrant() {
+        struct Nested;
+        impl fmt::Display for Nested {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                // A `Display` that formats another lazy value, as one that
+                // logs would.
+                let mut inner = String::new();
+                render_once(&"inner", |text| {
+                    inner.push_str(text.unwrap_or(""));
+                    Ok(())
+                })?;
+                f.write_str(&inner)
+            }
+        }
+        let mut seen = String::new();
+        render_once(&Nested, |text| {
+            seen.push_str(text.unwrap_or("<none>"));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, "inner");
     }
 
     #[test]
